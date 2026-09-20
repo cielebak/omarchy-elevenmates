@@ -741,6 +741,12 @@ def fetch_sofascore_league(slug, deadline=None, cache_dir=None, previous=None):
         goals = None
         prior = before.get(skeleton["id"])
         prior_goals = prior.get("goals") if prior else None
+        # A goal is only reusable if it still says which side it was for. One
+        # written by a version that dropped that flag would come back credited
+        # to the away club, and since its score has not moved it would never be
+        # fetched again - the cache would keep the mistake indefinitely.
+        if prior_goals and not all("isHome" in goal for goal in prior_goals):
+            prior_goals = None
         if prior_goals and scoreline_of(prior) == scoreline_of(skeleton):
             goals = prior_goals
         elif skeleton["state"] != "pre" and detailed < SOFA_MAX_DETAIL:
