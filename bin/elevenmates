@@ -675,7 +675,7 @@ def sofa_event(event, slug, league_name, goals):
     }
 
 
-def fetch_sofascore_league(slug, deadline=None, cache_dir=None):
+def fetch_sofascore_league(slug, deadline=None, cache_dir=None, previous=None):
     """Return (slug, name, matches, error), same contract as fetch_league."""
     name = COMPETITION_LABELS.get(slug, slug)
     tournament = SOFA_TOURNAMENTS[slug]
@@ -701,6 +701,11 @@ def fetch_sofascore_league(slug, deadline=None, cache_dir=None):
     except Exception as error:  # noqa: BLE001 - one league must not sink the run
         return slug, name, [], repr(error)
 
+    before = {}
+    for match in previous or []:
+        if isinstance(match, dict) and match.get("id"):
+            before[match["id"]] = match
+
     today = datetime.now().date()
     now = time.time()
     matches = []
@@ -712,10 +717,16 @@ def fetch_sofascore_league(slug, deadline=None, cache_dir=None):
             continue
         if skeleton is None or not is_today(skeleton, today, now):
             continue
-        # The scorers are a request each, so only the matches that can have any
-        # pay for one - and only up to a bounded number of them.
+
+        # The scorers are a request each, and a scoreline that has not moved
+        # cannot have grown a goal since the last sweep. Without this a Sunday
+        # afternoon of nine finished matches paid for nine requests every
+        # twenty seconds to be told the same thing.
         goals = None
-        if skeleton["state"] != "pre" and detailed < SOFA_MAX_DETAIL:
+        prior = before.get(skeleton["id"])
+        if prior and prior.get("goals") and scoreline_of(prior) == scoreline_of(skeleton):
+            goals = prior["goals"]
+        elif skeleton["state"] != "pre" and detailed < SOFA_MAX_DETAIL:
             detailed += 1
             goals = sofa_goals(str(event["id"]), deadline)
         if goals:
@@ -796,12 +807,12 @@ def fetch_sofascore_teams(slug):
     return teams
 
 
-def fetch_league(slug, deadline=None, cache_dir=None):
+def fetch_league(slug, deadline=None, cache_dir=None, previous=None):
     """Return (slug, name, matches, error). An error leaves matches empty."""
     if not valid_slug(slug):
         return slug, slug, [], "not a valid competition id"
     if slug in SOFA_TOURNAMENTS:
-        return fetch_sofascore_league(slug, deadline, cache_dir)
+        return fetch_sofascore_league(slug, deadline, cache_dir, previous)
     try:
         payload = read_json_url("%s/%s/scoreboard" % (SITE_API, slug), deadline)
     except NETWORK_ERRORS as error:
@@ -1280,7 +1291,12 @@ def fetch_once(args):
         workers = min(MAX_PARALLEL_REQUESTS, len(leagues))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             results = list(
-                pool.map(lambda slug: fetch_league(slug, deadline, cache_dir), leagues)
+                pool.map(
+                    lambda slug: fetch_league(
+                        slug, deadline, cache_dir, previous_by_league.get(slug)
+                    ),
+                    leagues,
+                )
             )
         for slug, name, league_matches, error in results:
             league_names[slug] = name

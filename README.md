@@ -91,9 +91,11 @@ played.
 Ekstraklasa is the one exception. ESPN publishes 219 soccer competitions and
 not one of them is Polish, so `pol.1` is served by Sofascore's public endpoints
 instead - also undocumented, also no key. It costs a little more per sweep: two
-requests for the round, and one per match that has kicked off for the scorers.
-Everything the second source returns is folded into the same shape as the
-first, so a Polish row on the card reads exactly like an English one.
+requests for the round, plus one for the scorers of any match whose score has
+moved since the last one. A scoreline that has not moved cannot have grown a
+goal, so in the steady state it is the two. Everything the second source
+returns is folded into the same shape as the first, so a Polish row on the card
+reads exactly like an English one.
 
 ## Competitions
 
