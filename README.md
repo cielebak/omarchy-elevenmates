@@ -18,7 +18,24 @@ omarchy plugin add https://github.com/cielebak/omarchy-elevenmates.git --enable
 
 Omarchy 4.0 or newer - that is the release whose shell loads third-party
 plugins from `~/.config/omarchy/plugins/`. Beyond it, Python 3 and
-`notify-send` are the only requirements, and Omarchy ships both.
+`notify-send` are the only requirements, and Omarchy ships both. Nothing
+outside the plugin's own directory is touched on install.
+
+## Remove
+
+```bash
+omarchy plugin remove elevenmates
+```
+
+That takes the widget out of the bar and deletes
+`~/.config/omarchy/plugins/elevenmates`. Two files are written outside it and
+are left behind, so reinstalling finds your competitions and clubs as you left
+them; delete them by hand if you want it gone completely:
+
+```bash
+rm -f ~/.config/omarchy/elevenmates.json          # your settings
+rm -rf ~/.local/state/omarchy/elevenmates         # the score cache
+```
 
 ## What the bar shows
 

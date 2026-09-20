@@ -496,8 +496,13 @@ def sofa_season(tournament_id, cache_dir, deadline=None):
     path = os.path.join(cache_dir or ".", SOFA_SEASON_CACHE)
     cached = load_cache(path)
     entry = cached.get(key) if isinstance(cached, dict) else None
-    if isinstance(entry, dict) and time.time() - float(entry.get("at") or 0) < SOFA_SEASON_AGE:
-        return entry.get("season")
+    if isinstance(entry, dict):
+        try:
+            fresh = time.time() - float(entry.get("at") or 0) < SOFA_SEASON_AGE
+        except (TypeError, ValueError):
+            fresh = False
+        if fresh and entry.get("season") is not None:
+            return entry["season"]
 
     payload = read_json_url(
         "%s/unique-tournament/%s/seasons" % (SOFA_API, tournament_id), deadline
@@ -528,8 +533,12 @@ SOFA_STATES = {
     "postponed": ("post", "STATUS_POSTPONED"),
     "canceled": ("post", "STATUS_CANCELED"),
     "cancelled": ("post", "STATUS_CANCELED"),
-    "interrupted": ("in", "STATUS_ABANDONED"),
-    "suspended": ("in", "STATUS_ABANDONED"),
+    # Stopped but not over, and the score still stands. Not ABANDONED: Model.js
+    # reads that word as a match that was never played and prints a dash where
+    # the score should be, on a row still sitting under LIVE.
+    "interrupted": ("in", "STATUS_SUSPENDED"),
+    "suspended": ("in", "STATUS_SUSPENDED"),
+    "abandoned": ("post", "STATUS_ABANDONED"),
     "willcontinue": ("in", "STATUS_IN_PROGRESS"),
 }
 
@@ -551,7 +560,10 @@ def sofa_minute(event, now=None):
     start = clock.get("currentPeriodStartTimestamp")
     initial = clock.get("initial")
     if start is None or initial is None:
-        return description
+        # No minute to be had - around the whistle, or during a delay. Better
+        # blank than the period's name: Model.isBreak reads any word as the
+        # ball not rolling, and this is a match that may well be running.
+        return ""
     elapsed = float(initial) + ((now if now is not None else time.time()) - float(start))
     if elapsed < 0:
         elapsed = 0.0
@@ -639,7 +651,11 @@ def sofa_event(event, slug, league_name, goals):
     resolved = []
     for goal in goals or []:
         entry = dict(goal)
-        entry["team"] = home["id"] if entry.pop("isHome", False) else away["id"]
+        # Read, not consumed: these goals are written to the cache and handed
+        # back in on a later sweep, and a goal that has forgotten which side it
+        # was for comes back credited to the away club - wrong colour, wrong
+        # scoreline, and a fresh goal key, so the whole match is announced again.
+        entry["team"] = home["id"] if entry.get("isHome") else away["id"]
         resolved.append(entry)
 
     kickoff = event.get("startTimestamp")
@@ -724,11 +740,17 @@ def fetch_sofascore_league(slug, deadline=None, cache_dir=None, previous=None):
         # twenty seconds to be told the same thing.
         goals = None
         prior = before.get(skeleton["id"])
-        if prior and prior.get("goals") and scoreline_of(prior) == scoreline_of(skeleton):
-            goals = prior["goals"]
+        prior_goals = prior.get("goals") if prior else None
+        if prior_goals and scoreline_of(prior) == scoreline_of(skeleton):
+            goals = prior_goals
         elif skeleton["state"] != "pre" and detailed < SOFA_MAX_DETAIL:
             detailed += 1
             goals = sofa_goals(str(event["id"]), deadline)
+            # One failed request must not empty the match: an empty goal list
+            # written to the cache is a match whose goals are all new again the
+            # moment the next request succeeds.
+            if goals is None:
+                goals = prior_goals
         if goals:
             skeleton = sofa_event(event, slug, name, goals) or skeleton
         matches.append(skeleton)
@@ -756,8 +778,22 @@ def fetch_sofascore_stats(event_id, deadline=None):
                 values[key] = (item.get("home"), item.get("away"))
 
     detail = event.get("event") or {}
-    home_id = SOFA_PREFIX + str((detail.get("homeTeam") or {}).get("id") or "")
-    away_id = SOFA_PREFIX + str((detail.get("awayTeam") or {}).get("id") or "")
+    home_id = str((detail.get("homeTeam") or {}).get("id") or "")
+    away_id = str((detail.get("awayTeam") or {}).get("id") or "")
+    # Without both, the two sides would share one key and the panel would draw
+    # a table of labels with no numbers under them.
+    if not home_id or not away_id or home_id == away_id:
+        return None
+    home_id = SOFA_PREFIX + home_id
+    away_id = SOFA_PREFIX + away_id
+
+    def cell(value):
+        # Zero is a number: "or" would turn a side's 0 corners into a blank
+        # where the other side shows a figure.
+        if value is None or value == "":
+            return ""
+        # Possession arrives as "64%" and the panel adds the sign itself.
+        return str(value).replace("%", "")
 
     by_id = {home_id: {}, away_id: {}}
     rows = []
@@ -765,9 +801,8 @@ def fetch_sofascore_stats(event_id, deadline=None):
         pair = values.get(key)
         if pair is None:
             continue
-        # Possession arrives as "64%" and the panel adds the sign itself.
-        by_id[home_id][key] = str(pair[0] or "").replace("%", "")
-        by_id[away_id][key] = str(pair[1] or "").replace("%", "")
+        by_id[home_id][key] = cell(pair[0])
+        by_id[away_id][key] = cell(pair[1])
         rows.append({"key": key, "label": label, "suffix": suffix})
 
     if not rows:
@@ -780,11 +815,11 @@ def fetch_sofascore_stats(event_id, deadline=None):
     }
 
 
-def fetch_sofascore_teams(slug):
+def fetch_sofascore_teams(slug, cache_dir=None):
     """The club picker's options for a Sofascore competition."""
     tournament = SOFA_TOURNAMENTS[slug]
     try:
-        season = sofa_season(tournament, None)
+        season = sofa_season(tournament, cache_dir)
         if season is None:
             return []
         payload = read_json_url(
@@ -1107,7 +1142,19 @@ def describe_score_move(match, old, seq):
         "score": scoreline_of(match),
         "home": match["home"]["abbr"],
         "away": match["away"]["abbr"],
+        # Flagged so the scoring play, when it turns up a sweep or two later,
+        # can take this entry's place instead of being a second celebration of
+        # the same goal.
+        "placeholder": True,
     }
+
+
+def take_placeholder(feed, match_id):
+    """Pull this match's oldest unnamed goal off the feed, if it has one."""
+    for index, entry in enumerate(feed):
+        if entry.get("placeholder") and entry.get("matchId") == match_id:
+            return index, entry
+    return None, None
 
 
 def announce_changes(
@@ -1159,8 +1206,20 @@ def announce_changes(
             # their own celebration rather than only the later one - each at the
             # score it was actually scored at.
             for index, goal in fresh:
+                score = score_at(match, current, index)
+                # This may be the goal an unnamed one already stood for. If so
+                # it takes that entry's place, keeping its number and its time
+                # so the bar does not celebrate the same goal twice, and no
+                # second notification goes out for it either.
+                slot, placeholder = take_placeholder(feed, match["id"])
+                if placeholder is not None:
+                    named = describe_goal(match, goal, placeholder["seq"], score)
+                    named["at"] = placeholder["at"]
+                    feed[slot] = named
+                    continue
+
                 seq += 1
-                entry = describe_goal(match, goal, seq, score_at(match, current, index))
+                entry = describe_goal(match, goal, seq, score)
                 feed.append(entry)
                 if notify_enabled:
                     notify(
@@ -1202,9 +1261,15 @@ def prune_follows(config_path, config, matches, errors, leagues):
     if not leagues or errors:
         return
     current = {match["id"] for match in matches}
-    alerts = as_string_list(config.get("alertMatches"))
+
+    # Read the file again and decide from that, not from the copy this run
+    # started with: a sweep can take most of a minute, and a pin set while it
+    # was in flight would otherwise be cleared for not being on a card that was
+    # fetched before it existed.
+    stored = load_config(config_path)
+    alerts = as_string_list(stored.get("alertMatches"))
     kept = [match_id for match_id in alerts if match_id in current]
-    pinned = str(config.get("pinnedMatch") or "")
+    pinned = str(stored.get("pinnedMatch") or "")
 
     changed = {}
     if len(kept) != len(alerts):
@@ -1214,9 +1279,6 @@ def prune_follows(config_path, config, matches, errors, leagues):
     if not changed:
         return
 
-    # Read it again rather than writing back the copy this run started with:
-    # the panel may have changed something else in the meantime.
-    stored = load_config(config_path)
     stored.update(changed)
     try:
         write_json_atomic(config_path, stored)
@@ -1471,9 +1533,9 @@ def command_leagues(_args):
     return 0
 
 
-def fetch_teams(slug):
+def fetch_teams(slug, cache_dir=None):
     if slug in SOFA_TOURNAMENTS:
-        return fetch_sofascore_teams(slug)
+        return fetch_sofascore_teams(slug, cache_dir)
     try:
         payload = read_json_url("%s/%s/teams" % (SITE_API, slug))
     except NETWORK_ERRORS:
@@ -1514,7 +1576,8 @@ def command_teams(args):
     if leagues:
         workers = min(MAX_PARALLEL_REQUESTS, len(leagues))
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            for teams in pool.map(fetch_teams, leagues):
+            fetch = lambda slug: fetch_teams(slug, os.path.dirname(args.out) or ".")
+            for teams in pool.map(fetch, leagues):
                 for team in teams:
                     # A club in two competitions is listed once, under the first.
                     by_id.setdefault(team["value"], team)
