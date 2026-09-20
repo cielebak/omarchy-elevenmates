@@ -219,6 +219,20 @@ function headlineRank(match, mine, nowMs) {
   return null
 }
 
+// How long until the next fixture kicks off, or -1 with none coming. The bar
+// knows what is live only from the last sweep, so without this a match that
+// starts just after one waits out a whole idle interval before anybody looks.
+function msToNextKickoff(matches, nowMs) {
+  var soonest = -1
+  for (var i = 0; i < matches.length; i++) {
+    if (!isUpcoming(matches[i])) continue
+    var away = matches[i].kickoffEpoch * 1000 - nowMs
+    if (away <= 0) continue
+    if (soonest < 0 || away < soonest) soonest = away
+  }
+  return soonest
+}
+
 // Panel grouping: live, then today's fixtures, then what has just finished.
 function sections(matches) {
   var live = []

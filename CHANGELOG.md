@@ -10,6 +10,33 @@
   are untouched, so nothing picked is lost.
 - The README lists every competition on the picker with its slug.
 
+Goal alerts, which were losing some of what they were meant to announce:
+
+- Two goals inside one refresh interval are two celebrations. The cache now
+  carries a short feed of goals rather than only the newest, and the bar takes
+  them in turn - briefly when there is a queue behind, at leisure when there is
+  not. Before, the first of them was simply dropped.
+- Each goal is reported at the score it was scored at, not at the score the
+  last one left behind.
+- A fixture about to kick off no longer waits out the whole idle interval. The
+  widget learns a match is live only by sweeping, so a kick-off just after one
+  went unseen for twenty minutes and its first goals arrived late and together.
+- A score that moves without a scoring play behind it now reaches the bar as
+  well. It used to raise a desktop notification and nothing else, so with
+  alerts switched off the one case the bar flash exists to cover was the one
+  case it missed.
+- The goal line on the bar is rebuilt properly for each goal. It was named in
+  the code but never actually named in the layout, so every goal threw a
+  reference error partway through announcing it.
+- The staleness guard clears the longest gap the widget will actually leave.
+  With a stretched idle interval it could be shorter than the wait it was
+  meant to survive, which would have silently disabled goal alerts.
+- Bells and the pin are forgotten once their match leaves today's card, instead
+  of piling up in the config file for every Saturday ever watched.
+- `--config` is honoured before the subcommand as well as after it. Before, it
+  was silently ignored there, so `elevenmates --config mine.json config set`
+  read and then rewrote the real config file.
+
 ## 1.0.0 - 2026-09-20
 
 First release.

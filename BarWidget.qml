@@ -117,6 +117,10 @@ BarWidget {
   property var goalFlash: null
   property int seenGoalSeq: -1
   property double seenGoalAt: 0
+  // Goals found in one sweep that have not had their turn on the bar yet. Two
+  // can easily land inside one refresh interval, and celebrating only the
+  // later one threw the first away.
+  property var goalPending: []
 
   // The celebration: the ball rolls to the right while the scorer scrolls
   // through the same slot the score normally occupies. Spin only ever
@@ -195,28 +199,68 @@ BarWidget {
   // in the cache file. That counter restarts from one whenever the file is
   // deleted rather than rewritten, and comparing against the old high-water
   // mark then swallowed real goals - which is exactly what it did.
-  function noteGoal(goal) {
-    if (!goal) return
-    var at = Number(goal.at) * 1000
-    var seq = Number(goal.seq)
-    if (!isFinite(at) || at <= 0) return
+  function noteGoals(feed) {
+    if (!feed) return
+    // An older cache carries a single goal rather than a feed of them.
+    var list = (typeof feed.length === "number") ? feed : [feed]
 
-    var known = at < root.seenGoalAt
-      || (at === root.seenGoalAt && isFinite(seq) && seq <= root.seenGoalSeq)
-    if (known) return
+    var fresh = []
+    for (var i = 0; i < list.length; i++) {
+      var goal = list[i]
+      if (!goal) continue
+      var at = Number(goal.at) * 1000
+      var seq = Number(goal.seq)
+      if (!isFinite(at) || at <= 0) continue
+      var known = at < root.seenGoalAt
+        || (at === root.seenGoalAt && isFinite(seq) && seq <= root.seenGoalSeq)
+      if (known) continue
+      fresh.push(goal)
+    }
+    if (fresh.length === 0) return
+
+    fresh.sort(function (a, b) {
+      return (Number(a.at) - Number(b.at)) || (Number(a.seq) - Number(b.seq))
+    })
 
     var first = root.seenGoalAt === 0
-    root.seenGoalAt = at
-    root.seenGoalSeq = isFinite(seq) ? seq : 0
+    var newest = fresh[fresh.length - 1]
+    root.seenGoalAt = Number(newest.at) * 1000
+    root.seenGoalSeq = isFinite(Number(newest.seq)) ? Number(newest.seq) : 0
 
     // The first cache read after a restart carries whatever the day already
     // held; replay only what is still fresh enough to be worth announcing.
-    if (first && Date.now() - at > 120000) return
+    if (first) {
+      var recent = []
+      for (var j = 0; j < fresh.length; j++) {
+        if (Date.now() - Number(fresh[j].at) * 1000 <= 120000) recent.push(fresh[j])
+      }
+      fresh = recent
+      if (fresh.length === 0) return
+    }
+
+    root.goalPending = root.goalPending.concat(fresh)
+    // One is on the bar already; it will call for the next when its turn ends.
+    if (!root.goalFlash) root.showNextGoal()
+  }
+
+  // Hand the bar the goal at the head of the queue, or give the slot back to
+  // the score when there is nothing waiting.
+  function showNextGoal() {
+    if (root.goalPending.length === 0) {
+      if (root.goalFlash) goalOutro.restart()
+      return
+    }
+    var queue = root.goalPending.slice()
+    var goal = queue.shift()
+    root.goalPending = queue
 
     root.goalFlash = goal
     root.flashColor = root.goalColor
     rollOut.to = root.ballSpin + 1080
     goalOutro.stop()
+    // A goal on its own is read at leisure; a queue behind it is not, or three
+    // goals would hold the bar for the better part of a minute.
+    goalHold.interval = queue.length > 0 ? 6000 : 14000
     goalHold.restart()
     goalAnim.restart()
 
@@ -224,8 +268,12 @@ BarWidget {
     // the letters that have already finished popping and the scroll position
     // of a line that no longer exists.
     root.labelX = 0
+    // Torn down and put back, which is what re-pops the letters. The binding
+    // has to be handed back afterwards: assigning `active` outright replaces
+    // it, and the line then had no way of ever switching itself off again -
+    // "GOAL" simply stayed on the bar over the score.
     goalLine.active = false
-    goalLine.active = true
+    goalLine.active = Qt.binding(function () { return root.goalFlash !== null })
     marquee.restart()
   }
 
@@ -356,7 +404,8 @@ BarWidget {
         // list, losing hover and scroll position with it.
         root.scores = parsed
         root.nowMs = Date.now()
-        root.noteGoal(parsed.lastGoal)
+        root.noteGoals(parsed.goalFeed || parsed.lastGoal)
+        root.armKickoffTimer()
         root.injectPanel()
       } catch (error) {}
     }
@@ -368,6 +417,9 @@ BarWidget {
       root.refreshing = false
       fetchWatchdog.stop()
       stateFile.reload()
+      // The reload above only reaches noteGoals when the file actually moved,
+      // and the next kick-off has to be aimed at either way.
+      root.armKickoffTimer()
       if (root.refreshQueued) {
         var wasForced = root.refreshQueued === "force"
         root.refreshQueued = false
@@ -383,6 +435,12 @@ BarWidget {
   // fires at all.
   property bool quietHours: false
 
+  // The ceiling on the stretch below. The helper's staleness guard has to
+  // clear this, or a quiet night would be mistaken for a suspend and the first
+  // goals after it would never be announced; IDLE_STRETCH_CAP in
+  // bin/elevenmates is the same number on the other side.
+  readonly property int idleStretchCapMs: 45 * 60 * 1000
+
   readonly property int refreshIntervalMs: {
     if (root.liveCount > 0) return root.liveRefreshSec * 1000
     var base = root.idleRefreshMin * 60 * 1000
@@ -390,9 +448,39 @@ BarWidget {
     // sweep can turn up is a fixture that is still hours away. Overnight there
     // is not even that until the next day's list is published.
     if (root.matches.length === 0) {
-      return Math.min(base * (root.quietHours ? 6 : 3), 90 * 60 * 1000)
+      return Math.min(base * (root.quietHours ? 6 : 3), root.idleStretchCapMs)
     }
     return base
+  }
+
+  // A fixture about to start is the one thing the idle interval cannot handle
+  // on its own: the widget learns a match is live only by sweeping, so a
+  // kick-off a minute after a sweep went unseen for the whole interval and its
+  // first goals arrived twenty minutes late, all at once. This is a single
+  // shot aimed at the whistle, re-armed after every sweep.
+  function armKickoffTimer() {
+    kickoffTimer.stop()
+    var away = Model.msToNextKickoff(root.matches, Date.now())
+    if (away < 0) return
+    // A little after the hour: the scoreboard takes a moment to turn the
+    // fixture over, and arriving early only costs a second sweep.
+    kickoffTimer.interval = Math.max(5000, Math.min(away + 20000, 6 * 60 * 60 * 1000))
+    kickoffTimer.start()
+  }
+
+  Timer {
+    id: kickoffTimer
+    repeat: false
+    running: false
+    onTriggered: {
+      // Still not due - the timer was capped rather than aimed. Aim again
+      // rather than spending a request on a match that has not started.
+      if (Model.msToNextKickoff(root.matches, Date.now()) > 60000) {
+        root.armKickoffTimer()
+        return
+      }
+      root.refresh()
+    }
   }
 
   Timer {
@@ -409,9 +497,7 @@ BarWidget {
     id: goalHold
     interval: 14000
     repeat: false
-    onTriggered: {
-      goalOutro.restart()
-    }
+    onTriggered: root.showNextGoal()
   }
 
   SequentialAnimation {
@@ -618,9 +704,12 @@ BarWidget {
         font.bold: root.headline ? Model.isLive(root.headline) : false
       }
 
-      // Torn down and rebuilt for every goal - see noteGoal - which is what
-      // makes the letters pop again each time one goes in.
+      // Torn down and rebuilt for every goal - see showNextGoal - which is
+      // what makes the letters pop again each time one goes in. It needs the
+      // id to be torn down by name; without it every goal threw a reference
+      // error halfway through, and the rebuild never happened.
       Loader {
+        id: goalLine
         active: root.goalFlash !== null
         x: root.labelX
         anchors.verticalCenter: parent.verticalCenter
