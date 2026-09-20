@@ -9,7 +9,7 @@ import "Model.js" as Model
 // passive view that gets the parsed state injected into it.
 BarWidget {
   id: root
-  moduleName: "jarek.elevenmates"
+  moduleName: "elevenmates"
 
   readonly property string home: Quickshell.env("HOME") || ""
   // Derived from where this file actually is, so a clone under another name,
@@ -533,7 +533,7 @@ BarWidget {
   }
 
   IpcHandler {
-    target: "jarek.elevenmates"
+    target: "elevenmates"
 
     function refresh(): void { root.broadcast("forceRefresh") }
     function expand(league: string, id: string): void { root.expand(league, id) }

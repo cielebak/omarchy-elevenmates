@@ -122,12 +122,12 @@ bin/elevenmates teams                 # club picker options
 Over IPC:
 
 ```bash
-omarchy-shell jarek.elevenmates refresh
-omarchy-shell jarek.elevenmates open
-omarchy-shell jarek.elevenmates close
-omarchy-shell jarek.elevenmates toggle
-omarchy-shell jarek.elevenmates settings
-omarchy-shell jarek.elevenmates expand <league> <event-id>
+omarchy-shell elevenmates refresh
+omarchy-shell elevenmates open
+omarchy-shell elevenmates close
+omarchy-shell elevenmates toggle
+omarchy-shell elevenmates settings
+omarchy-shell elevenmates expand <league> <event-id>
 ```
 
 Middle-clicking the bar widget also forces a refresh.

@@ -12,8 +12,8 @@ import "Model.js" as Model
 // widget's shell.json entry; see the note in BarWidget.qml for why.
 Panel {
   id: root
-  moduleName: "jarek.elevenmates"
-  ipcTarget: "jarek.elevenmates"
+  moduleName: "elevenmates"
+  ipcTarget: "elevenmates"
   manageIpc: false
 
   property var anchorItem: null
