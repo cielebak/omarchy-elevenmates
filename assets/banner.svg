@@ -1,0 +1,266 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1536" height="1024" viewBox="0 0 1536 1024" font-family="CaskaydiaMono Nerd Font, JetBrains Mono, DejaVu Sans Mono, monospace">
+  <title>Elevenmates — live football scores in the Omarchy bar</title>
+
+  <defs>
+    <linearGradient id="page" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0" stop-color="#070A0E"/>
+      <stop offset="1" stop-color="#030507"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.78" cy="0.62" r="0.55">
+      <stop offset="0" stop-color="#5AF78E" stop-opacity="0.13"/>
+      <stop offset="1" stop-color="#5AF78E" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowLeft" cx="0.1" cy="0.3" r="0.5">
+      <stop offset="0" stop-color="#57C7FF" stop-opacity="0.07"/>
+      <stop offset="1" stop-color="#57C7FF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="cardFace" x1="0" y1="0" x2="0.3" y2="1">
+      <stop offset="0" stop-color="#121A24"/>
+      <stop offset="1" stop-color="#070A0E"/>
+    </linearGradient>
+    <linearGradient id="fade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#070A0E" stop-opacity="0"/>
+      <stop offset="1" stop-color="#070A0E" stop-opacity="0.96"/>
+    </linearGradient>
+
+    <!-- The ball: a disc with five pentagons cut out of it, even-odd, so the
+         patches are holes rather than shapes painted in the background's
+         colour. Proportions measured rather than guessed; see
+         assets/generate-ball.py, which writes this block. -->
+    <g id="ball" stroke="none">
+      <path fill-rule="evenodd" d="M-8.200 0 A8.200 8.200 0 1 0 8.200 0 A8.200 8.200 0 1 0 -8.200 0 Z M4.352 -5.990 L5.240 -3.258 L2.916 -1.570 L0.592 -3.258 L1.480 -5.990 Z M7.042 2.288 L4.718 3.977 L2.394 2.288 L3.282 -0.444 L6.155 -0.444 Z M0.000 7.405 L-2.324 5.716 L-1.436 2.984 L1.436 2.984 L2.324 5.716 Z M-7.042 2.288 L-6.155 -0.444 L-3.282 -0.444 L-2.394 2.288 L-4.718 3.977 Z M-4.352 -5.990 L-1.480 -5.990 L-0.592 -3.258 L-2.916 -1.570 L-5.240 -3.258 Z"/>
+    </g>
+
+    <!-- Bar and panel iconography, as paths so the image needs no icon font. -->
+    <g id="eye">
+      <path d="M-9 0 C-5.5 -5.5 5.5 -5.5 9 0 C5.5 5.5 -5.5 5.5 -9 0 Z" fill="none" stroke-width="1.6"/>
+      <circle cx="0" cy="0" r="2.6"/>
+    </g>
+    <g id="bell">
+      <path d="M-5.6 3.2 C-5.6 -1.2 -4.6 -5 0 -5 C4.6 -5 5.6 -1.2 5.6 3.2 Z" stroke-width="1.5" fill="none"/>
+      <path d="M-7 3.2 L7 3.2" stroke-width="1.5"/>
+      <path d="M-1.8 5.4 C-1.2 6.6 1.2 6.6 1.8 5.4" stroke-width="1.5" fill="none"/>
+    </g>
+    <g id="prompt">
+      <rect x="-15" y="-13" width="30" height="26" rx="7" fill="none" stroke="#5AF78E" stroke-width="2"/>
+      <path d="M-7 -5 L-1.5 0 L-7 5" fill="none" stroke="#5AF78E" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M1.5 5.5 L8 5.5" stroke="#5AF78E" stroke-width="2" stroke-linecap="round"/>
+    </g>
+  </defs>
+
+  <rect width="1536" height="1024" fill="url(#page)"/>
+  <rect width="1536" height="1024" fill="url(#glowLeft)"/>
+  <rect width="1536" height="1024" fill="url(#glow)"/>
+
+  <!-- The ball sits behind the card, cropped by the canvas: decoration, not a subject. -->
+  <g transform="translate(1265 700) scale(35.9)" opacity="0.055" fill="#5AF78E">
+    <use href="#ball"/>
+  </g>
+
+  <!-- ============================== the bar ============================== -->
+  <g>
+    <rect x="0" y="0" width="1536" height="56" fill="#0B0F14"/>
+    <rect x="0" y="55" width="1536" height="1" fill="#121A24"/>
+
+    <g transform="translate(46 28) scale(0.62)"><use href="#prompt"/></g>
+
+    <text x="82" y="33" font-size="15" fill="#2C3E56">│</text>
+
+    <!-- The widget, mid-celebration: a goal takes the bar for a few seconds. -->
+    <g transform="translate(126 28)"><g fill="#5AF78E" stroke="#5AF78E"><use href="#ball"/></g></g>
+    <text x="146" y="33" font-size="15" font-weight="700" fill="#5AF78E" letter-spacing="0.4">GOAL  Haaland (Man City) 67'  4-2</text>
+
+    <g fill="#3E5470">
+      <circle cx="1286" cy="28" r="3.2"/>
+      <circle cx="1302" cy="28" r="3.2"/>
+      <circle cx="1318" cy="28" r="3.2"/>
+    </g>
+    <text x="1352" y="33" font-size="14" fill="#6B9981">Sun 20 Sep 15:56</text>
+  </g>
+
+  <!-- ============================ left column ============================ -->
+  <g transform="translate(92 0)">
+    <g transform="translate(16 266)"><use href="#prompt"/></g>
+    <text x="48" y="273" font-size="17" fill="#2C3E56">│</text>
+    <text x="76" y="273" font-size="20" fill="#7CFFB2" letter-spacing="1.5">cielebak/<tspan fill="#5AF78E" font-weight="700">omarchy-elevenmates</tspan></text>
+
+    <text x="2" y="378" font-size="17" fill="#6B9981" letter-spacing="7.5">ELEVENMATES</text>
+
+    <text x="0" y="452" font-size="62" fill="#F1F1F0" letter-spacing="-1">Live football</text>
+    <text x="0" y="524" font-size="62" fill="#F1F1F0" letter-spacing="-1">in your bar.</text>
+
+    <text x="2" y="586" font-size="21" fill="#6B9981">Real-time scores. Live results.</text>
+    <text x="2" y="618" font-size="21" fill="#6B9981">Right where you work.</text>
+
+    <!-- What the bar itself carries, in its two states. -->
+    <g transform="translate(2 700)">
+      <text x="0" y="0" font-size="13" fill="#5c739b" letter-spacing="2.6">IN THE BAR</text>
+
+      <g transform="translate(0 22)">
+        <rect x="0" y="0" width="470" height="44" rx="9" fill="#0B0F14" stroke="#1B2635"/>
+        <g transform="translate(26 22)"><g fill="#7CFFB2" stroke="#7CFFB2"><use href="#ball"/></g></g>
+        <text x="50" y="27" font-size="16" fill="#A9FFCD" font-weight="700">MNC 3-2 SUN 51'</text>
+        <text x="262" y="27" font-size="13" fill="#5c739b">the match you picked</text>
+      </g>
+
+      <g transform="translate(0 80)">
+        <rect x="0" y="0" width="470" height="44" rx="9" fill="#0C1A13" stroke="#5AF78E" stroke-opacity="0.45"/>
+        <g transform="translate(26 22)"><g fill="#5AF78E" stroke="#5AF78E"><use href="#ball"/></g></g>
+        <text x="50" y="27" font-size="16" fill="#5AF78E" font-weight="700">GOAL  Haaland (MCI) 67'</text>
+        <text x="290" y="27" font-size="13" fill="#5E9E78">in the club's colour</text>
+      </g>
+    </g>
+  </g>
+
+  <!-- ============================== the card ============================== -->
+  <g transform="translate(742 116)">
+    <rect x="0" y="0" width="726" height="726" rx="16" fill="url(#cardFace)" stroke="#5AF78E" stroke-opacity="0.55" stroke-width="1.5"/>
+
+    <!-- header -->
+    <text x="28" y="44" font-size="14" font-weight="700" fill="#5AF78E" letter-spacing="2.4">LIVE · 8</text>
+    <text x="670" y="44" font-size="13" fill="#5c739b" text-anchor="end">updated 7s ago</text>
+    <g transform="translate(690 39)" stroke="#5AF78E" stroke-width="1.7" fill="none" stroke-linecap="round">
+      <path d="M-7 1 A7 7 0 1 1 -2.5 7"/>
+      <path d="M-7 -4.5 L-7 1 L-1.6 1"/>
+    </g>
+    <g transform="translate(28 62)" font-size="13" font-weight="700" letter-spacing="1.6">
+      <rect x="0" y="0" width="106" height="30" rx="7" fill="#5AF78E" fill-opacity="0.14"/>
+      <text x="53" y="20" fill="#5AF78E" text-anchor="middle">MATCHES</text>
+      <text x="171" y="20" fill="#5c739b" text-anchor="middle">SETTINGS</text>
+    </g>
+
+    <text x="28" y="118" font-size="13" fill="#5c739b">Click a match for its numbers. The eye picks the one the</text>
+    <text x="28" y="136" font-size="13" fill="#5c739b">bar shows, the bell adds it to the goal alerts.</text>
+
+    <text x="28" y="172" font-size="13" font-weight="700" fill="#5AF78E" letter-spacing="2.4">LIVE</text>
+
+    <g font-size="15" transform="translate(0 46)">
+      <!-- row 1 -->
+      <g transform="translate(0 150)">
+        <g transform="translate(40 0)" stroke="#3E5470" fill="#3E5470"><use href="#eye"/></g>
+        <g transform="translate(70 0)" stroke="#3E5470" fill="none"><use href="#bell"/></g>
+        <text x="94" y="5" font-size="13" fill="#5c739b">LaLiga</text>
+        <text x="408" y="5" fill="#A9FFCD" text-anchor="end">Atlético</text>
+        <text x="444" y="5" fill="#A9FFCD" font-weight="700" text-anchor="middle">0-0</text>
+        <text x="480" y="5" fill="#A9FFCD">Real Madrid</text>
+        <text x="698" y="5" font-size="13" fill="#5AF78E" text-anchor="end">12'</text>
+      </g>
+      <!-- row 2 -->
+      <g transform="translate(0 186)">
+        <g transform="translate(40 0)" stroke="#3E5470" fill="#3E5470"><use href="#eye"/></g>
+        <g transform="translate(70 0)" stroke="#3E5470" fill="none"><use href="#bell"/></g>
+        <text x="94" y="5" font-size="13" fill="#5c739b">Serie A</text>
+        <text x="408" y="5" fill="#A9FFCD" text-anchor="end">Frosinone</text>
+        <text x="444" y="5" fill="#A9FFCD" font-weight="700" text-anchor="middle">2-0</text>
+        <text x="480" y="5" fill="#6B9981">Como</text>
+        <text x="698" y="5" font-size="13" fill="#5AF78E" text-anchor="end">61'</text>
+      </g>
+      <!-- row 3 -->
+      <g transform="translate(0 222)">
+        <g transform="translate(40 0)" stroke="#3E5470" fill="#3E5470"><use href="#eye"/></g>
+        <g transform="translate(70 0)" stroke="#5AF78E" fill="none"><use href="#bell"/></g>
+        <text x="94" y="5" font-size="13" fill="#5c739b">Ligue 1</text>
+        <text x="408" y="5" fill="#A9FFCD" text-anchor="end">Auxerre</text>
+        <text x="444" y="5" fill="#A9FFCD" font-weight="700" text-anchor="middle">1-1</text>
+        <text x="480" y="5" fill="#A9FFCD">Brest</text>
+        <text x="698" y="5" font-size="13" fill="#5AF78E" text-anchor="end">73'</text>
+      </g>
+
+      <!-- row 4: the one the bar is holding, opened -->
+      <g transform="translate(0 258)">
+        <rect x="22" y="-15" width="682" height="30" rx="7" fill="#5AF78E" fill-opacity="0.11"/>
+        <rect x="29" y="-12" width="24" height="24" rx="6" fill="#5AF78E" fill-opacity="0.24"/>
+        <g transform="translate(41 0)" stroke="#5AF78E" fill="#5AF78E"><use href="#eye"/></g>
+        <text x="94" y="5" font-size="13" fill="#6B9981">Premier League</text>
+        <text x="408" y="5" fill="#5AF78E" font-weight="700" text-anchor="end">Man City</text>
+        <text x="444" y="5" fill="#5AF78E" font-weight="700" text-anchor="middle">4-3</text>
+        <text x="480" y="5" fill="#6B9981">Sunderland</text>
+        <text x="698" y="5" font-size="13" fill="#5AF78E" text-anchor="end">67'</text>
+      </g>
+
+      <!-- the opened match: scorers, then the numbers -->
+      <g transform="translate(0 276)">
+        <rect x="22" y="0" width="682" height="176" rx="9" fill="#F1F1F0" fill-opacity="0.035"/>
+
+        <g font-size="13" fill="#7CFFB2">
+          <text x="352" y="30" text-anchor="end">Haaland</text>
+          <text x="392" y="30" fill="#5c739b" text-anchor="middle">14'</text>
+
+          <text x="352" y="52" text-anchor="end">Foden</text>
+          <text x="392" y="52" fill="#5c739b" text-anchor="middle">31'</text>
+
+          <text x="432" y="74">Isidor</text>
+          <text x="392" y="74" fill="#5c739b" text-anchor="middle">45'+3'</text>
+        </g>
+
+        <rect x="96" y="90" width="536" height="1" fill="#F1F1F0" fill-opacity="0.09"/>
+
+        <g font-size="13">
+          <g transform="translate(0 116)">
+            <text x="336" y="0" fill="#A9FFCD" font-weight="700" text-anchor="end">64%</text>
+            <text x="392" y="0" fill="#5c739b" text-anchor="middle">Possession</text>
+            <text x="448" y="0" fill="#6B9981">36%</text>
+            <rect x="344" y="8" width="60" height="3" rx="1.5" fill="#5AF78E"/>
+            <rect x="406" y="8" width="34" height="3" rx="1.5" fill="#F1F1F0" fill-opacity="0.22"/>
+          </g>
+          <g transform="translate(0 148)">
+            <text x="336" y="0" fill="#A9FFCD" font-weight="700" text-anchor="end">17</text>
+            <text x="392" y="0" fill="#5c739b" text-anchor="middle">Shots</text>
+            <text x="448" y="0" fill="#6B9981">9</text>
+            <rect x="344" y="8" width="61" height="3" rx="1.5" fill="#5AF78E"/>
+            <rect x="407" y="8" width="33" height="3" rx="1.5" fill="#F1F1F0" fill-opacity="0.22"/>
+          </g>
+        </g>
+      </g>
+
+      <!-- back to the list -->
+      <g transform="translate(0 486)">
+        <g transform="translate(40 0)" stroke="#3E5470" fill="#3E5470"><use href="#eye"/></g>
+        <g transform="translate(70 0)" stroke="#3E5470" fill="none"><use href="#bell"/></g>
+        <text x="94" y="5" font-size="13" fill="#5c739b">Premier League</text>
+        <text x="408" y="5" fill="#6B9981" text-anchor="end">Bournemouth</text>
+        <text x="444" y="5" fill="#A9FFCD" font-weight="700" text-anchor="middle">0-1</text>
+        <text x="480" y="5" fill="#A9FFCD">Liverpool</text>
+        <text x="698" y="5" font-size="13" fill="#5AF78E" text-anchor="end">73'</text>
+      </g>
+      <g transform="translate(0 522)">
+        <g transform="translate(40 0)" stroke="#3E5470" fill="#3E5470"><use href="#eye"/></g>
+        <g transform="translate(70 0)" stroke="#3E5470" fill="none"><use href="#bell"/></g>
+        <text x="94" y="5" font-size="13" fill="#5c739b">Bundesliga</text>
+        <text x="408" y="5" fill="#A9FFCD" text-anchor="end">Leverkusen</text>
+        <text x="444" y="5" fill="#A9FFCD" font-weight="700" text-anchor="middle">1-0</text>
+        <text x="480" y="5" fill="#6B9981">RB Leipzig</text>
+        <text x="698" y="5" font-size="13" fill="#4E8A68" text-anchor="end">HT</text>
+      </g>
+
+      <text x="28" y="576" font-size="13" font-weight="700" fill="#7CFFB2" letter-spacing="2.4">COMING UP</text>
+
+      <g transform="translate(0 604)">
+        <g transform="translate(40 0)" stroke="#3E5470" fill="#3E5470"><use href="#eye"/></g>
+        <g transform="translate(70 0)" stroke="#3E5470" fill="none"><use href="#bell"/></g>
+        <text x="94" y="5" font-size="13" fill="#5c739b">Premier League</text>
+        <text x="408" y="5" fill="#A9FFCD" text-anchor="end">Fulham</text>
+        <text x="444" y="5" fill="#5c739b" text-anchor="middle">–</text>
+        <text x="480" y="5" fill="#A9FFCD">Man United</text>
+        <text x="698" y="5" font-size="13" fill="#5c739b" text-anchor="end">17:30</text>
+      </g>
+      <g transform="translate(0 640)">
+        <g transform="translate(40 0)" stroke="#3E5470" fill="#3E5470"><use href="#eye"/></g>
+        <g transform="translate(70 0)" stroke="#3E5470" fill="none"><use href="#bell"/></g>
+        <text x="94" y="5" font-size="13" fill="#5c739b">Serie A</text>
+        <text x="408" y="5" fill="#A9FFCD" text-anchor="end">Juventus</text>
+        <text x="444" y="5" fill="#5c739b" text-anchor="middle">–</text>
+        <text x="480" y="5" fill="#A9FFCD">Atalanta</text>
+        <text x="698" y="5" font-size="13" fill="#5c739b" text-anchor="end">18:00</text>
+      </g>
+    </g>
+
+    <!-- the list runs on; it does not stop where the card does -->
+    <rect x="3" y="636" width="720" height="88" fill="url(#fade)"/>
+    <rect x="706" y="140" width="5" height="560" rx="2.5" fill="#F1F1F0" fill-opacity="0.07"/>
+    <rect x="706" y="150" width="5" height="330" rx="2.5" fill="#F1F1F0" fill-opacity="0.26"/>
+  </g>
+
+  <!-- =============================== footer =============================== -->
+  <g transform="translate(1444 954) scale(0.72)" opacity="0.5"><use href="#prompt"/></g>
+</svg>

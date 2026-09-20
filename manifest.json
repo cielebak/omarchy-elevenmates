@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "jarek.elevenmates",
+  "name": "Elevenmates",
+  "version": "1.0.0",
+  "author": "Jarosław Cielebąk",
+  "license": "MIT",
+  "description": "Live football scores in the Omarchy bar. Pick the competitions and the clubs you follow, and the bar carries the score of whichever of their matches is running right now.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Elevenmates",
+    "description": "Live football scores for the competitions and clubs you follow",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "center"
+  },
+  "homepage": "https://github.com/cielebak/omarchy-elevenmates",
+  "repository": "https://github.com/cielebak/omarchy-elevenmates"
+}

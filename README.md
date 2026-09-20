@@ -1,0 +1,138 @@
+# Elevenmates
+
+![Elevenmates in the Omarchy bar](preview.png)
+
+Live football scores in the [Omarchy](https://omarchy.org/) bar.
+
+The bar carries one match: the one you picked, or - if you picked none - the
+most interesting one it can find right now. Clicking the button opens today's
+card: what is running, what kicks off later, what has just finished.
+
+No account, no API key, nothing to configure before it works.
+
+## Install
+
+```bash
+omarchy plugin add https://github.com/cielebak/omarchy-elevenmates.git --enable
+```
+
+Omarchy 4.0 or newer - that is the release whose shell loads third-party
+plugins from `~/.config/omarchy/plugins/`. Beyond it, Python 3 and
+`notify-send` are the only requirements, and Omarchy ships both.
+
+## What the bar shows
+
+```
+⚽ MNC 3-2 SUN 51'                     a live match
+⚽ MNC 3-2 SUN HT                      the same match on its tea break
+⚽ FUL – MAN 17:30                     a fixture later today
+⚽ GOAL  Haaland (Man City) 67'  4-2   for a few seconds after a goal
+```
+
+A goal pulses the widget in the scoring club's own colour, names the scorer,
+and - unless switched off - raises a notification.
+
+## The card
+
+Every row carries two switches on the left:
+
+- **The eye** picks the match the bar shows. Only one can be on, because the
+  bar carries one match. Turn it off and the bar goes back to choosing - or,
+  under `Picked match only`, carries nothing at all.
+- **The bell** adds that match to the goal alerts. As many as you like. It is
+  hidden on the row the eye is on: the match the bar carries is alerted on
+  anyway, so a bell there would be a switch that changes nothing. Turn the eye
+  off and the bell comes back as you left it.
+
+Neither switch is drawn on a match that has already been played: there is
+nothing left to follow and no goal left to announce. One that was already on
+stays until you turn it off, so a row never carries a setting you cannot
+clear.
+
+Clicking the rest of the row opens the match: who scored and when, then
+possession, shots, shots on target, corners, cards and fouls, each with a meter
+so the shape of the match reads without reading a number. Those numbers cost
+their own request, so they are only fetched for the match you have open.
+
+## Settings
+
+In the panel, under **SETTINGS**:
+
+| Setting | What it does |
+| --- | --- |
+| Competitions | Which ones are fetched. One request each, so a shorter list refreshes faster and a longer one raises the floor under the live refresh interval. Pick none and the widget shows nothing at all. |
+| Your clubs | Their matches sort first, the bar prefers them, and they get goal alerts without touching the bell. |
+| What the bar shows | `Auto` falls back to any live match when none of your clubs are playing. `Favorites only` and `Any live match` are the strict readings. `Picked match only` does not fall back at all: with no eye on a row the bar carries nothing and shrinks to the ball. |
+| Notify on goals | And whether that covers every match or only the ones you marked. |
+| Refresh intervals | One for while a match is live, one for the rest of the day. The live one will not go below two seconds per competition followed. With nothing at all on today's card the idle one stretches itself, and stretches further between 01:00 and 07:00. |
+| Test the goal alert | Fires the alert once off a real match, so the colours can be checked without waiting for someone to score. |
+
+Settings live in `~/.config/omarchy/elevenmates.json`, not in the widget's
+`shell.json` entry. `omarchy bar set` hands its value to the shell over an IPC
+call that flattens a JSON array into separate arguments, so a list of
+competitions comes back as a bare string - or is rejected outright. Keeping the
+file separate also means picking a match does not rewrite `shell.json` and
+reload the whole bar.
+
+## Where the data comes from
+
+ESPN's public endpoints - no account and no key. They are undocumented and
+publish no rate limit, which is not the same as having none, so the widget
+keeps its own: at most six requests in flight, one connection per worker reused
+across the sweep, and a floor under the live refresh interval that rises with
+the number of competitions followed.
+`bin/elevenmates fetch` asks one scoreboard endpoint per competition in
+parallel and folds the answers into
+`~/.local/state/omarchy/elevenmates/state.json`, which the QML side watches. A
+competition that fails to answer keeps its previous matches rather than
+blanking the bar. Only today's fixtures are kept, plus anything still being
+played.
+
+43 competitions are on the picker: the big European leagues and their cups, the
+European club competitions, the national-team tournaments, and MLS, Liga MX,
+Brasileirao, Liga Profesional and the Saudi Pro League. Any other ESPN league
+slug works if you put it into the config file by hand.
+
+Ekstraklasa is not in ESPN's coverage.
+
+## Commands
+
+```bash
+bin/elevenmates fetch                 # refresh the cache now
+bin/elevenmates config show           # every setting
+bin/elevenmates config get leagues    # one setting
+bin/elevenmates config set leagues '["eng.1","uefa.champions"]'
+bin/elevenmates demo-goal             # fire the goal alert once
+bin/elevenmates leagues               # competition picker options
+bin/elevenmates teams                 # club picker options
+```
+
+`fetch` takes:
+
+| Flag | What it does |
+| --- | --- |
+| `--force` | Sweep even if another widget just did. A refresh asked for by hand is never skipped; the widget's own timer does not pass this. |
+| `--headline <event-id>` | The match the bar is carrying, so its goals count as watched even with no club followed and no bell set. |
+| `--stats <league>:<event-id>` | Also fetch that one match's team numbers. The panel passes whichever card it has open. |
+| `--out <path>` | Where the cache is written. Defaults to `~/.local/state/omarchy/elevenmates/state.json`. |
+
+`demo-goal` takes `--out` and `--scorer <name>`; every command takes
+`--config <path>`.
+
+Over IPC:
+
+```bash
+omarchy-shell jarek.elevenmates refresh
+omarchy-shell jarek.elevenmates open
+omarchy-shell jarek.elevenmates close
+omarchy-shell jarek.elevenmates toggle
+omarchy-shell jarek.elevenmates settings
+omarchy-shell jarek.elevenmates expand <league> <event-id>
+```
+
+Middle-clicking the bar widget also forces a refresh.
+
+## Licence
+
+MIT. Not affiliated with ESPN; it reads the same public endpoints a browser
+does.
