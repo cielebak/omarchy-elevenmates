@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Score fetcher behind the Elevenmates bar widget.
 
-Talks to ESPN's public scoreboard endpoints, which need no key and no account.
-One request per followed competition, run in parallel, folded into a single
-cache file the QML side watches. A competition that fails keeps its previous
-matches instead of blanking the bar.
+Talks to ESPN's public scoreboard endpoints, which need no key and no account,
+and to Sofascore for the competitions ESPN does not carry - Ekstraklasa is the
+only one so far. One request per followed competition, run in parallel, folded
+into a single cache file the QML side watches. A competition that fails keeps
+its previous matches instead of blanking the bar.
 
 Settings live in ~/.config/omarchy/elevenmates.json rather than in the widget's
 shell.json entry: `omarchy bar set` hands its value to the shell over an IPC
@@ -49,6 +50,37 @@ NETWORK_ERRORS = (
 )
 
 SITE_API = "https://site.api.espn.com/apis/site/v2/sports/soccer"
+
+# ESPN publishes 219 soccer competitions and not one of them is Polish, so
+# Ekstraklasa cannot come from the same place as everything else. Sofascore
+# carries it, needs no key either, and answers the three things the widget
+# actually needs: the round's fixtures, a running clock, and the scoring plays
+# with the scorer on them. It is an undocumented endpoint and may change under
+# us; a competition that fails keeps its previous matches, so the worst case is
+# a stale Polish row rather than a broken bar.
+SOFA_API = "https://api.sofascore.com/api/v1"
+
+# Slug -> Sofascore "unique tournament" id. Everything not listed here goes to
+# ESPN, which is still the source for the other forty-three competitions.
+SOFA_TOURNAMENTS = {
+    "pol.1": 202,
+}
+
+# Sofascore ids are its own numbering and would otherwise collide with ESPN's -
+# 86 is Real Madrid over there and somebody else entirely here. The prefix
+# keeps favourites, pins and bells unambiguous whichever source they came from.
+# A dash rather than a colon: match ids travel through `--stats <league>:<id>`.
+SOFA_PREFIX = "sofa-"
+
+# The season the current round belongs to, so the fixture list can be asked
+# for. It changes once a year; re-asking on every sweep would be a third of the
+# competition's traffic for an answer that never moves.
+SOFA_SEASON_CACHE = "sofascore.json"
+SOFA_SEASON_AGE = 12 * 60 * 60
+
+# One request per match for the scorers, so the sweep cannot grow without
+# bound on a full matchday.
+SOFA_MAX_DETAIL = 10
 
 CONFIG_PATH = os.path.expanduser("~/.config/omarchy/elevenmates.json")
 STATE_PATH = os.path.expanduser(
@@ -125,6 +157,7 @@ COMPETITIONS = [
     ("fra.1", "Ligue 1", "France"),
     ("fra.coupe_de_france", "Coupe de France", "France"),
     ("ned.1", "Eredivisie", "Netherlands"),
+    ("pol.1", "Ekstraklasa", "Poland"),
     ("por.1", "Primeira Liga", "Portugal"),
     ("sco.1", "Premiership", "Scotland"),
     ("bel.1", "Pro League", "Belgium"),
@@ -360,6 +393,17 @@ SUMMARY_STATS = [
     ("foulsCommitted", "Fouls", ""),
 ]
 
+# The same six rows as Sofascore names them, so a Polish match reads exactly
+# like an English one in the panel.
+SOFA_STAT_KEYS = {
+    "ballPossession": "possessionPct",
+    "totalShotsOnGoal": "totalShots",
+    "shotsOnGoal": "shotsOnTarget",
+    "cornerKicks": "wonCorners",
+    "yellowCards": "yellowCards",
+    "fouls": "foulsCommitted",
+}
+
 
 def fetch_stats(league, event_id, deadline=None):
     """Per-team numbers for one match, from ESPN's summary endpoint.
@@ -369,6 +413,8 @@ def fetch_stats(league, event_id, deadline=None):
     """
     if not valid_slug(league) or not valid_slug(str(event_id)):
         return None
+    if league in SOFA_TOURNAMENTS:
+        return fetch_sofascore_stats(str(event_id)[len(SOFA_PREFIX):], deadline)
     try:
         payload = read_json_url(
             "%s/%s/summary?event=%s" % (SITE_API, league, event_id), deadline
@@ -423,10 +469,325 @@ def valid_slug(slug):
     return bool(slug) and bool(SLUG_PATTERN.match(slug))
 
 
-def fetch_league(slug, deadline=None):
+# --------------------------------------------------------------- Sofascore
+#
+# The second source, for the competitions ESPN does not carry. Everything below
+# ends in the same match dictionary parse_event builds, so nothing downstream -
+# the sorting, the goal diff, the QML - knows there are two providers.
+
+
+def sofa_season(tournament_id, cache_dir, deadline=None):
+    """The season the current round sits in, cached for half a day."""
+    key = str(tournament_id)
+    path = os.path.join(cache_dir or ".", SOFA_SEASON_CACHE)
+    cached = load_cache(path)
+    entry = cached.get(key) if isinstance(cached, dict) else None
+    if isinstance(entry, dict) and time.time() - float(entry.get("at") or 0) < SOFA_SEASON_AGE:
+        return entry.get("season")
+
+    payload = read_json_url(
+        "%s/unique-tournament/%s/seasons" % (SOFA_API, tournament_id), deadline
+    )
+    seasons = payload.get("seasons") or []
+    if not seasons:
+        return None
+    season = seasons[0].get("id")
+    if season is None:
+        return None
+    if cache_dir:
+        cached = cached if isinstance(cached, dict) else {}
+        cached[key] = {"season": season, "at": int(time.time())}
+        try:
+            write_json_atomic(path, cached)
+        except OSError:
+            pass
+    return season
+
+
+# Sofascore's status.type, in the vocabulary the rest of the file speaks. The
+# names are ESPN's, because Model.js reads them to tell a goalless draw from a
+# match that was never played.
+SOFA_STATES = {
+    "inprogress": ("in", "STATUS_IN_PROGRESS"),
+    "notstarted": ("pre", "STATUS_SCHEDULED"),
+    "finished": ("post", "STATUS_FULL_TIME"),
+    "postponed": ("post", "STATUS_POSTPONED"),
+    "canceled": ("post", "STATUS_CANCELED"),
+    "cancelled": ("post", "STATUS_CANCELED"),
+    "interrupted": ("in", "STATUS_ABANDONED"),
+    "suspended": ("in", "STATUS_ABANDONED"),
+    "willcontinue": ("in", "STATUS_IN_PROGRESS"),
+}
+
+
+def sofa_minute(event, now=None):
+    """The running clock, as "67'" or "45'+2'".
+
+    Sofascore sends the moment the current period started and how many seconds
+    were already on the clock when it did; the minute is arithmetic from there.
+    The half is not counted while the ball is not rolling, so a break returns
+    its own label instead and Model.isBreak can tell the two apart.
+    """
+    status = event.get("status") or {}
+    description = status.get("description") or ""
+    if status.get("code") == 31 or description.lower() in ("halftime", "half time"):
+        return "HT"
+
+    clock = event.get("time") or {}
+    start = clock.get("currentPeriodStartTimestamp")
+    initial = clock.get("initial")
+    if start is None or initial is None:
+        return description
+    elapsed = float(initial) + ((now if now is not None else time.time()) - float(start))
+    if elapsed < 0:
+        elapsed = 0.0
+    limit = clock.get("max")
+    if limit is not None and elapsed > float(limit):
+        return "%d'+%d'" % (int(limit) // 60, int(elapsed - float(limit)) // 60 + 1)
+    return "%d'" % (int(elapsed) // 60 + 1)
+
+
+def sofa_competitor(team, score):
+    colors = team.get("teamColors") or {}
+    primary = colors.get("primary") or ""
+    name = team.get("shortName") or team.get("name") or "?"
+    return {
+        "id": SOFA_PREFIX + str(team.get("id") or ""),
+        "abbr": team.get("nameCode") or name[:3].upper() or "?",
+        "name": name,
+        "fullName": team.get("name") or "",
+        "logo": "%s/team/%s/image" % (SOFA_API, team.get("id")) if team.get("id") else "",
+        # Sofascore sends white for a club whose kit has no second colour, and
+        # a white flash on a light bar is no flash at all. Model.readableColor
+        # pushes it away from the bar, so only a missing value is dropped.
+        "color": primary if primary.startswith("#") else "",
+        "score": str(score) if score not in (None, "") else "",
+        "winner": False,
+    }
+
+
+def sofa_goals(event_id, deadline=None):
+    """The scoring plays for one match, oldest first, shaped like parse_goals."""
+    try:
+        payload = read_json_url(
+            "%s/event/%s/incidents" % (SOFA_API, event_id), deadline
+        )
+    except NETWORK_ERRORS:
+        return None
+
+    goals = []
+    # Sofascore lists the newest incident first; the goal keys downstream count
+    # a side's goals in order, so they have to be turned round.
+    for incident in reversed(payload.get("incidents") or []):
+        if incident.get("incidentType") != "goal":
+            continue
+        kind = incident.get("incidentClass") or ""
+        if kind == "penaltyShootout":
+            continue
+        player = incident.get("player") or {}
+        minute = incident.get("time")
+        added = incident.get("addedTime")
+        if minute is None:
+            label = ""
+        elif added:
+            label = "%d'+%d'" % (minute, added)
+        else:
+            label = "%d'" % minute
+        goals.append(
+            {
+                "minute": label,
+                # Filled in by sofa_event, which is where the two club ids are.
+                "team": "",
+                "scorer": player.get("shortName") or player.get("name") or "",
+                "ownGoal": kind == "ownGoal",
+                "penalty": kind == "penalty",
+                "isHome": bool(incident.get("isHome")),
+            }
+        )
+    return goals
+
+
+def sofa_event(event, slug, league_name, goals):
+    home_team = event.get("homeTeam") or {}
+    away_team = event.get("awayTeam") or {}
+    if not home_team.get("id") or not away_team.get("id"):
+        return None
+
+    status = event.get("status") or {}
+    state, status_name = SOFA_STATES.get(
+        (status.get("type") or "").lower(), ("pre", "STATUS_SCHEDULED")
+    )
+    home = sofa_competitor(home_team, (event.get("homeScore") or {}).get("current"))
+    away = sofa_competitor(away_team, (event.get("awayScore") or {}).get("current"))
+
+    # The incidents endpoint says which side a goal counts for, not which club
+    # id; both are known only here, where the two teams are.
+    resolved = []
+    for goal in goals or []:
+        entry = dict(goal)
+        entry["team"] = home["id"] if entry.pop("isHome", False) else away["id"]
+        resolved.append(entry)
+
+    kickoff = event.get("startTimestamp")
+    when = (
+        datetime.fromtimestamp(kickoff, timezone.utc) if kickoff else None
+    )
+    if state == "in":
+        short = sofa_minute(event)
+    elif state == "post":
+        short = "FT" if status_name == "STATUS_FULL_TIME" else (
+            status.get("description") or ""
+        )
+    else:
+        short = when.astimezone().strftime("%H:%M") if when else ""
+
+    return {
+        "id": SOFA_PREFIX + str(event.get("id") or ""),
+        "league": slug,
+        "leagueName": league_name,
+        "state": state,
+        "statusName": status_name,
+        "statusShort": short,
+        "statusDetail": status.get("description") or "",
+        "clock": short if state == "in" else "",
+        "period": 2 if (event.get("lastPeriod") or "") == "period2" else 1,
+        "kickoff": when.isoformat() if when else "",
+        "kickoffEpoch": int(kickoff) if kickoff else 0,
+        "kickoffLocal": when.astimezone().strftime("%H:%M") if when else "",
+        "note": "",
+        "goals": resolved,
+        "home": home,
+        "away": away,
+    }
+
+
+def fetch_sofascore_league(slug, deadline=None, cache_dir=None):
+    """Return (slug, name, matches, error), same contract as fetch_league."""
+    name = COMPETITION_LABELS.get(slug, slug)
+    tournament = SOFA_TOURNAMENTS[slug]
+    try:
+        season = sofa_season(tournament, cache_dir, deadline)
+        if season is None:
+            return slug, name, [], "no current season"
+        # Two windows rather than a fixture list for a date: the round that has
+        # been played and the one coming, which between them always contain
+        # today whatever day of the week it is.
+        events = {}
+        for window in ("last", "next"):
+            payload = read_json_url(
+                "%s/unique-tournament/%s/season/%s/events/%s/0"
+                % (SOFA_API, tournament, season, window),
+                deadline,
+            )
+            for event in payload.get("events") or []:
+                if event.get("id"):
+                    events[event["id"]] = event
+    except NETWORK_ERRORS as error:
+        return slug, name, [], str(error)
+    except Exception as error:  # noqa: BLE001 - one league must not sink the run
+        return slug, name, [], repr(error)
+
+    today = datetime.now().date()
+    now = time.time()
+    matches = []
+    detailed = 0
+    for event in events.values():
+        try:
+            skeleton = sofa_event(event, slug, name, None)
+        except (AttributeError, TypeError, KeyError, IndexError, ValueError):
+            continue
+        if skeleton is None or not is_today(skeleton, today, now):
+            continue
+        # The scorers are a request each, so only the matches that can have any
+        # pay for one - and only up to a bounded number of them.
+        goals = None
+        if skeleton["state"] != "pre" and detailed < SOFA_MAX_DETAIL:
+            detailed += 1
+            goals = sofa_goals(str(event["id"]), deadline)
+        if goals:
+            skeleton = sofa_event(event, slug, name, goals) or skeleton
+        matches.append(skeleton)
+    return slug, name, matches, None
+
+
+def fetch_sofascore_stats(event_id, deadline=None):
+    """Per-team numbers for one Sofascore match, in SUMMARY_STATS' vocabulary."""
+    try:
+        payload = read_json_url(
+            "%s/event/%s/statistics" % (SOFA_API, event_id), deadline
+        )
+        event = read_json_url("%s/event/%s" % (SOFA_API, event_id), deadline)
+    except NETWORK_ERRORS:
+        return None
+
+    periods = payload.get("statistics") or []
+    if not periods:
+        return None
+    values = {}
+    for group in periods[0].get("groups") or []:
+        for item in group.get("statisticsItems") or []:
+            key = SOFA_STAT_KEYS.get(item.get("key"))
+            if key and key not in values:
+                values[key] = (item.get("home"), item.get("away"))
+
+    detail = event.get("event") or {}
+    home_id = SOFA_PREFIX + str((detail.get("homeTeam") or {}).get("id") or "")
+    away_id = SOFA_PREFIX + str((detail.get("awayTeam") or {}).get("id") or "")
+
+    by_id = {home_id: {}, away_id: {}}
+    rows = []
+    for key, label, suffix in SUMMARY_STATS:
+        pair = values.get(key)
+        if pair is None:
+            continue
+        # Possession arrives as "64%" and the panel adds the sign itself.
+        by_id[home_id][key] = str(pair[0] or "").replace("%", "")
+        by_id[away_id][key] = str(pair[1] or "").replace("%", "")
+        rows.append({"key": key, "label": label, "suffix": suffix})
+
+    if not rows:
+        return None
+    return {
+        "matchId": SOFA_PREFIX + str(event_id),
+        "at": int(time.time()),
+        "teams": by_id,
+        "rows": rows,
+    }
+
+
+def fetch_sofascore_teams(slug):
+    """The club picker's options for a Sofascore competition."""
+    tournament = SOFA_TOURNAMENTS[slug]
+    try:
+        season = sofa_season(tournament, None)
+        if season is None:
+            return []
+        payload = read_json_url(
+            "%s/unique-tournament/%s/season/%s/teams" % (SOFA_API, tournament, season)
+        )
+    except NETWORK_ERRORS:
+        return []
+    league = COMPETITION_LABELS.get(slug, slug)
+    teams = []
+    for team in payload.get("teams") or []:
+        if not team.get("id"):
+            continue
+        teams.append(
+            {
+                "value": SOFA_PREFIX + str(team["id"]),
+                "label": team.get("name") or team.get("shortName") or "?",
+                "description": league,
+            }
+        )
+    return teams
+
+
+def fetch_league(slug, deadline=None, cache_dir=None):
     """Return (slug, name, matches, error). An error leaves matches empty."""
     if not valid_slug(slug):
         return slug, slug, [], "not a valid competition id"
+    if slug in SOFA_TOURNAMENTS:
+        return fetch_sofascore_league(slug, deadline, cache_dir)
     try:
         payload = read_json_url("%s/%s/scoreboard" % (SITE_API, slug), deadline)
     except NETWORK_ERRORS as error:
@@ -798,10 +1159,13 @@ def fetch_once(args):
     matches = []
     errors = []
     league_names = {}
+    cache_dir = os.path.dirname(args.out) or "."
     if leagues:
         workers = min(MAX_PARALLEL_REQUESTS, len(leagues))
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            results = list(pool.map(lambda slug: fetch_league(slug, deadline), leagues))
+            results = list(
+                pool.map(lambda slug: fetch_league(slug, deadline, cache_dir), leagues)
+            )
         for slug, name, league_matches, error in results:
             league_names[slug] = name
             if error is None:
@@ -962,6 +1326,8 @@ def command_leagues(_args):
 
 
 def fetch_teams(slug):
+    if slug in SOFA_TOURNAMENTS:
+        return fetch_sofascore_teams(slug)
     try:
         payload = read_json_url("%s/%s/teams" % (SITE_API, slug))
     except NETWORK_ERRORS:

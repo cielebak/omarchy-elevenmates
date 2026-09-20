@@ -76,7 +76,7 @@ reload the whole bar.
 
 ## Where the data comes from
 
-ESPN's public endpoints - no account and no key. They are undocumented and
+Mostly ESPN's public endpoints - no account and no key. They are undocumented and
 publish no rate limit, which is not the same as having none, so the widget
 keeps its own: at most six requests in flight, one connection per worker reused
 across the sweep, and a floor under the live refresh interval that rises with
@@ -88,12 +88,90 @@ competition that fails to answer keeps its previous matches rather than
 blanking the bar. Only today's fixtures are kept, plus anything still being
 played.
 
-43 competitions are on the picker: the big European leagues and their cups, the
-European club competitions, the national-team tournaments, and MLS, Liga MX,
-Brasileirao, Liga Profesional and the Saudi Pro League. Any other ESPN league
-slug works if you put it into the config file by hand.
+Ekstraklasa is the one exception. ESPN publishes 219 soccer competitions and
+not one of them is Polish, so `pol.1` is served by Sofascore's public endpoints
+instead - also undocumented, also no key. It costs a little more per sweep: two
+requests for the round, and one per match that has kicked off for the scorers.
+Everything the second source returns is folded into the same shape as the
+first, so a Polish row on the card reads exactly like an English one.
 
-Ekstraklasa is not in ESPN's coverage.
+## Competitions
+
+44 on the picker. Any competition ESPN carries works even when it is not
+listed - put its slug into `leagues` in the config file by hand and it is
+fetched like the rest.
+
+**England**
+
+| Slug | Competition |
+| --- | --- |
+| `eng.1` | Premier League |
+| `eng.2` | Championship |
+| `eng.fa` | FA Cup |
+| `eng.league_cup` | EFL Cup |
+
+**Rest of Europe**
+
+| Slug | Competition | Country |
+| --- | --- | --- |
+| `esp.1` | LaLiga | Spain |
+| `esp.copa_del_rey` | Copa del Rey | Spain |
+| `ger.1` | Bundesliga | Germany |
+| `ger.2` | 2. Bundesliga | Germany |
+| `ger.dfb_pokal` | DFB-Pokal | Germany |
+| `ita.1` | Serie A | Italy |
+| `ita.coppa_italia` | Coppa Italia | Italy |
+| `fra.1` | Ligue 1 | France |
+| `fra.coupe_de_france` | Coupe de France | France |
+| `ned.1` | Eredivisie | Netherlands |
+| `pol.1` | Ekstraklasa | Poland |
+| `por.1` | Primeira Liga | Portugal |
+| `sco.1` | Premiership | Scotland |
+| `bel.1` | Pro League | Belgium |
+| `tur.1` | Super Lig | Turkey |
+| `gre.1` | Super League | Greece |
+| `aut.1` | Bundesliga | Austria |
+| `swe.1` | Allsvenskan | Sweden |
+| `nor.1` | Eliteserien | Norway |
+| `den.1` | Superliga | Denmark |
+
+**Outside Europe**
+
+| Slug | Competition | Country |
+| --- | --- | --- |
+| `usa.1` | MLS | United States |
+| `mex.1` | Liga MX | Mexico |
+| `bra.1` | Brasileirao | Brazil |
+| `arg.1` | Liga Profesional | Argentina |
+| `ksa.1` | Saudi Pro League | Saudi Arabia |
+
+**European club competitions**
+
+| Slug | Competition |
+| --- | --- |
+| `uefa.champions` | Champions League |
+| `uefa.champions_qual` | Champions League qualifying |
+| `uefa.europa` | Europa League |
+| `uefa.europa_qual` | Europa League qualifying |
+| `uefa.europa.conf` | Conference League |
+| `uefa.europa.conf_qual` | Conference League qualifying |
+| `uefa.super_cup` | UEFA Super Cup |
+| `fifa.cwc` | Club World Cup |
+
+**National teams**
+
+| Slug | Competition |
+| --- | --- |
+| `fifa.world` | World Cup |
+| `fifa.worldq.uefa` | World Cup qualifying, Europe |
+| `uefa.euro` | European Championship |
+| `uefa.euroq` | European Championship qualifying |
+| `uefa.nations` | Nations League |
+| `uefa.euro_u21` | Euro U21 |
+| `fifa.friendly` | International friendlies |
+
+Ten are picked out of the box: the five big leagues, the three European club
+competitions, the Nations League and World Cup qualifying.
 
 ## Commands
 
@@ -134,5 +212,5 @@ Middle-clicking the bar widget also forces a refresh.
 
 ## Licence
 
-MIT. Not affiliated with ESPN; it reads the same public endpoints a browser
-does.
+MIT. Not affiliated with ESPN or Sofascore; it reads the same public endpoints
+a browser does.

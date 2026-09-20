@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.0 - 2026-09-20
+
+- Ekstraklasa. ESPN carries no Polish football at all, so `pol.1` is served by
+  Sofascore instead, folded into the same shape as everything else: scorers,
+  the running minute, club colours and the match numbers all read the same.
+- The plugin id is now `elevenmates`, without the vendor prefix. An install
+  under the old id has to be added again; the settings file and the score cache
+  are untouched, so nothing picked is lost.
+- The README lists every competition on the picker with its slug.
+
 ## 1.0.0 - 2026-09-20
 
 First release.
