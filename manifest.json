@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "elevenmates",
   "name": "Elevenmates",
-  "version": "1.1.0",
+  "version": "1.0.0",
   "author": "Jarosław Cielebąk",
   "license": "MIT",
   "description": "Live football scores in the Omarchy bar. Pick the competitions and the clubs you follow, and the bar carries the score of whichever of their matches is running right now.",

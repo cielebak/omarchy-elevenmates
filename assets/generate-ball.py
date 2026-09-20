@@ -1,4 +1,4 @@
-"""Regenerate the football mark used by Ball.qml and assets/banner.svg.
+"""Regenerate the football mark in assets/banner.svg.
 
 The mark is a disc with five pentagons cut out of it, which is the shorthand
 everyone reads as a football. An honest projection of the real solid was tried
@@ -10,15 +10,13 @@ The proportions are measured, not guessed - patch circumradius and centre
 distance as fractions of the disc's own radius, each patch turned so a flat
 edge faces outwards, one of them square at the bottom.
 
-    python3 assets/generate-ball.py svg   # the <g id="ball"> block for the banner
-    python3 assets/generate-ball.py qml   # the path string for Ball.qml
+    python3 assets/generate-ball.py   # the <g id="ball"> block for the banner
 
 The result is one path with an even-odd fill, so the patches are holes rather
 than shapes in the background's colour - the bar's background is a theme away
 from being anything at all.
 """
 import math
-import sys
 
 PATCH_RADIUS = 0.298     # of the disc's radius
 PATCH_CENTRE = 0.605     # how far out the patches sit
@@ -51,10 +49,6 @@ def ball_path(radius=1.0, decimals=4):
 
 
 if __name__ == "__main__":
-    what = sys.argv[1] if len(sys.argv) > 1 else "svg"
-    if what == "qml":
-        print(ball_path(1.0, 4))
-    else:
-        print('    <g id="ball" stroke="none">')
-        print('      <path fill-rule="evenodd" d="%s"/>' % ball_path(8.2, 3))
-        print('    </g>')
+    print('    <g id="ball" stroke="none">')
+    print('      <path fill-rule="evenodd" d="%s"/>' % ball_path(8.2, 3))
+    print('    </g>')
