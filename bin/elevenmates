@@ -117,6 +117,12 @@ MAX_BODY_BYTES = 4 * 1024 * 1024
 MAX_DECOMPRESSED_BYTES = 16 * 1024 * 1024
 READ_CHUNK_BYTES = 64 * 1024
 
+# What a single document may spend on the wire when nobody handed the request a
+# deadline - the club list and the season lookup. REQUEST_TIMEOUT cannot serve
+# as that budget: it is how long a quiet stretch may last, and 373 KB over a
+# tethered phone legitimately takes longer than one of those.
+UNTIMED_BODY_BUDGET = 60
+
 # The widget exists once per monitor, each with its own timer, so two fetches
 # can start within milliseconds of each other. They would double the traffic,
 # announce every goal twice and race each other's writes. One lock and one
@@ -266,13 +272,18 @@ def read_body(response, deadline):
     response.read() with no argument keeps reading for as long as the far end
     keeps sending: the socket timeout limits one quiet stretch, not the whole
     transfer, so a slow trickle can outlive any deadline the sweep set itself.
+
+    read1 rather than read: read(n) waits for all n bytes and only the stream
+    ending releases it, so an endpoint dripping a byte at a time holds a single
+    call open indefinitely and neither ceiling below is ever reached. read1
+    hands over whatever has arrived, which is what makes them ceilings.
     """
     chunks = []
     total = 0
     while True:
         if time.time() >= deadline:
             raise TimeoutError("response body outlived its deadline")
-        chunk = response.read(READ_CHUNK_BYTES)
+        chunk = response.read1(READ_CHUNK_BYTES)
         if not chunk:
             return b"".join(chunks)
         total += len(chunk)
@@ -328,13 +339,14 @@ def read_json_url(url, deadline=None):
         "Connection": "keep-alive",
     }
 
-    # The same absolute deadline as the rest of the sweep, and a request that
-    # arrived without one gets its own. Never tighter than the socket timeout
-    # above, so a request whose deadline has already gone keeps the second that
-    # timeout floor leaves it rather than losing the body it just asked for.
-    body_deadline = time.time() + timeout
-    if deadline is not None:
-        body_deadline = max(deadline, body_deadline)
+    # The same absolute deadline as the rest of the sweep, never tighter than
+    # the socket timeout above: a request whose deadline has already gone keeps
+    # the second that timeout floor leaves it rather than being sent and then
+    # having its answer thrown away unread.
+    if deadline is None:
+        body_deadline = time.time() + UNTIMED_BODY_BUDGET
+    else:
+        body_deadline = max(deadline, time.time() + timeout)
 
     while True:
         connection, reused = take_connection(host, timeout)
