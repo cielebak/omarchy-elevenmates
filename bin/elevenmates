@@ -25,6 +25,7 @@ import errno
 import fcntl
 import gzip
 import http.client
+import io
 import json
 import os
 import re
@@ -35,6 +36,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
@@ -104,6 +106,16 @@ DEFAULT_CONFIG = {
 }
 REQUEST_TIMEOUT = 12
 MAX_PARALLEL_REQUESTS = 6
+
+# A response is read in chunks against these two ceilings instead of being
+# swallowed whole. The largest document either endpoint serves is the club
+# list at 373 KB; a whole sweep of ten competitions is 70 KB compressed and
+# 742 KB expanded. Anything an order of magnitude past that is not football,
+# so the read stops there rather than letting a hostile or broken endpoint
+# dribble bytes forever or hand back a gzip bomb.
+MAX_BODY_BYTES = 4 * 1024 * 1024
+MAX_DECOMPRESSED_BYTES = 16 * 1024 * 1024
+READ_CHUNK_BYTES = 64 * 1024
 
 # The widget exists once per monitor, each with its own timer, so two fetches
 # can start within milliseconds of each other. They would double the traffic,
@@ -248,6 +260,48 @@ def drop_connection(host):
             pass
 
 
+def read_body(response, deadline):
+    """The response body, bounded in bytes and in wall clock time.
+
+    response.read() with no argument keeps reading for as long as the far end
+    keeps sending: the socket timeout limits one quiet stretch, not the whole
+    transfer, so a slow trickle can outlive any deadline the sweep set itself.
+    """
+    chunks = []
+    total = 0
+    while True:
+        if time.time() >= deadline:
+            raise TimeoutError("response body outlived its deadline")
+        chunk = response.read(READ_CHUNK_BYTES)
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > MAX_BODY_BYTES:
+            raise ValueError("response body over %d bytes" % MAX_BODY_BYTES)
+        chunks.append(chunk)
+
+
+def gunzip_body(payload):
+    """Expand a gzip body, refusing one that expands out of all proportion."""
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(payload)) as stream:
+            body = stream.read(MAX_DECOMPRESSED_BYTES + 1)
+    except EOFError:
+        # A body cut off mid-stream is a failed request like any other, and the
+        # sweep only knows how to keep the previous matches for those.
+        raise ValueError("response ended mid-gzip-stream")
+    except zlib.error as error:
+        # Corrupt deflate data raises outside the OSError family that the rest
+        # of the fetch treats as a network failure, so it is translated here
+        # rather than escaping every caller that only handles NETWORK_ERRORS.
+        raise ValueError("response is not readable gzip: %s" % error)
+    if len(body) > MAX_DECOMPRESSED_BYTES:
+        raise ValueError(
+            "response expands past %d bytes" % MAX_DECOMPRESSED_BYTES
+        )
+    return body
+
+
 def read_json_url(url, deadline=None):
     """One scoreboard or summary document.
 
@@ -274,12 +328,19 @@ def read_json_url(url, deadline=None):
         "Connection": "keep-alive",
     }
 
+    # The same absolute deadline as the rest of the sweep, and a request that
+    # arrived without one gets its own. Never tighter than the socket timeout
+    # above, so a request whose deadline has already gone keeps the second that
+    # timeout floor leaves it rather than losing the body it just asked for.
+    body_deadline = time.time() + timeout
+    if deadline is not None:
+        body_deadline = max(deadline, body_deadline)
+
     while True:
         connection, reused = take_connection(host, timeout)
         try:
             connection.request("GET", target, headers=headers)
             response = connection.getresponse()
-            payload = response.read()
         except (http.client.HTTPException, OSError):
             drop_connection(host)
             # A kept connection the far end closed in the meantime fails before
@@ -296,9 +357,25 @@ def read_json_url(url, deadline=None):
             raise urllib.error.HTTPError(
                 url, response.status, response.reason, response.headers, None
             )
-        if response.headers.get("Content-Encoding", "").lower() == "gzip":
-            payload = gzip.decompress(payload)
-        return json.loads(payload.decode("utf-8"))
+
+        try:
+            payload = read_body(response, body_deadline)
+        except (http.client.HTTPException, OSError, ValueError):
+            # Whatever went wrong - a limit, the deadline, a dead socket - the
+            # body is half read and the connection is out of step with the
+            # protocol, so it is closed rather than handed to the next request.
+            # No retry either: the request was answered, just not acceptably.
+            drop_connection(host)
+            raise
+        break
+
+    if response.headers.get("Content-Encoding", "").lower() == "gzip":
+        try:
+            payload = gunzip_body(payload)
+        except (OSError, ValueError):
+            drop_connection(host)
+            raise
+    return json.loads(payload.decode("utf-8"))
 
 
 def parse_kickoff(value):
