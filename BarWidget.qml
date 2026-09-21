@@ -324,10 +324,11 @@ BarWidget {
   // whether the score is 0-0 or 10-0, and whether a goal is being announced.
   // A slot that resizes shoves every widget beside it.
   // Nothing to say, no room taken: with no match on the bar the slot collapses
-  // to the ball alone rather than leaving a score-wide hole in the row.
+  // to the ball alone rather than leaving a score-wide hole in the row. A goal
+  // is something to say even then - the alert can be fired on a day with no
+  // fixtures at all - so it opens the slot back up for as long as it is up.
   readonly property int windowWidth:
-    (matches.length === 0 || (!headline && !goalFlash))
-      ? 0 : Math.ceil(slotMetrics.width)
+    (!headline && !goalFlash) ? 0 : Math.ceil(slotMetrics.width)
   // The geometry of the one button: a slot for the ball, a gap, the line.
   readonly property int edgePad: Style.space(5)
   readonly property int ballSlot: Math.round(Style.font.icon * 1.25)
