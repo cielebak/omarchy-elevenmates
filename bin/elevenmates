@@ -2,7 +2,7 @@
 """Score fetcher behind the Elevenmates bar widget.
 
 Talks to ESPN's public scoreboard endpoints, which need no key and no account,
-and to Sofascore for the competitions ESPN does not carry - Ekstraklasa is the
+and to LiveScore for the competitions ESPN does not carry - Ekstraklasa is the
 only one so far. One request per followed competition, run in parallel, folded
 into a single cache file the QML side watches. A competition that fails keeps
 its previous matches instead of blanking the bar.
@@ -54,35 +54,31 @@ NETWORK_ERRORS = (
 SITE_API = "https://site.api.espn.com/apis/site/v2/sports/soccer"
 
 # ESPN publishes 219 soccer competitions and not one of them is Polish, so
-# Ekstraklasa cannot come from the same place as everything else. Sofascore
+# Ekstraklasa cannot come from the same place as everything else. LiveScore
 # carries it, needs no key either, and answers the three things the widget
-# actually needs: the round's fixtures, a running clock, and the scoring plays
-# with the scorer on them. It is an undocumented endpoint and may change under
-# us; a competition that fails keeps its previous matches, so the worst case is
-# a stale Polish row rather than a broken bar.
-SOFA_API = "https://api.sofascore.com/api/v1"
+# actually needs: the season's fixtures with a running clock, and per match the
+# scoring plays with the scorer on them. It is an undocumented endpoint and may
+# change under us; a competition that fails keeps its previous matches, so the
+# worst case is a stale Polish row rather than a broken bar. Sofascore served
+# this until 2026-10, when it started answering 403 to anything not a browser.
+LS_API = "https://prod-cdn-public-api.livescore.com/v1/api/app"
+LS_IMAGES = "https://lsm-static-prod.livescore.com/medium"
 
-# Slug -> Sofascore "unique tournament" id. Everything not listed here goes to
-# ESPN, which is still the source for the other forty-three competitions.
-SOFA_TOURNAMENTS = {
-    "pol.1": 202,
+# Slug -> LiveScore stage path. Everything not listed here goes to ESPN, which
+# is still the source for the other forty-three competitions.
+LS_STAGES = {
+    "pol.1": "poland/ekstraklasa",
 }
 
-# Sofascore ids are its own numbering and would otherwise collide with ESPN's -
-# 86 is Real Madrid over there and somebody else entirely here. The prefix
-# keeps favourites, pins and bells unambiguous whichever source they came from.
-# A dash rather than a colon: match ids travel through `--stats <league>:<id>`.
-SOFA_PREFIX = "sofa-"
-
-# The season the current round belongs to, so the fixture list can be asked
-# for. It changes once a year; re-asking on every sweep would be a third of the
-# competition's traffic for an answer that never moves.
-SOFA_SEASON_CACHE = "sofascore.json"
-SOFA_SEASON_AGE = 12 * 60 * 60
+# LiveScore ids are its own numbering and would otherwise collide with ESPN's.
+# The prefix keeps favourites, pins and bells unambiguous whichever source they
+# came from. A dash rather than a colon: match ids travel through
+# `--stats <league>:<id>`.
+LS_PREFIX = "ls-"
 
 # One request per match for the scorers, so the sweep cannot grow without
 # bound on a full matchday.
-SOFA_MAX_DETAIL = 10
+LS_MAX_DETAIL = 10
 
 CONFIG_PATH = os.path.expanduser("~/.config/omarchy/elevenmates.json")
 STATE_PATH = os.path.expanduser(
@@ -513,15 +509,16 @@ SUMMARY_STATS = [
     ("foulsCommitted", "Fouls", ""),
 ]
 
-# The same six rows as Sofascore names them, so a Polish match reads exactly
-# like an English one in the panel.
-SOFA_STAT_KEYS = {
-    "ballPossession": "possessionPct",
-    "totalShotsOnGoal": "totalShots",
-    "shotsOnGoal": "shotsOnTarget",
-    "cornerKicks": "wonCorners",
-    "yellowCards": "yellowCards",
-    "fouls": "foulsCommitted",
+# The same six rows from LiveScore's counters, so a Polish match reads exactly
+# like an English one in the panel. Shots are on, off and blocked together,
+# which is what ESPN's total counts too.
+LS_STAT_KEYS = {
+    "possessionPct": ("Pss",),
+    "totalShots": ("Shon", "Shof", "Shbl"),
+    "shotsOnTarget": ("Shon",),
+    "wonCorners": ("Cos",),
+    "yellowCards": ("Ycs",),
+    "foulsCommitted": ("Fls",),
 }
 
 
@@ -533,8 +530,8 @@ def fetch_stats(league, event_id, deadline=None):
     """
     if not valid_slug(league) or not valid_slug(str(event_id)):
         return None
-    if league in SOFA_TOURNAMENTS:
-        return fetch_sofascore_stats(str(event_id)[len(SOFA_PREFIX):], deadline)
+    if league in LS_STAGES:
+        return fetch_livescore_stats(str(event_id)[len(LS_PREFIX):], deadline)
     try:
         payload = read_json_url(
             "%s/%s/summary?event=%s" % (SITE_API, league, event_id), deadline
@@ -589,136 +586,116 @@ def valid_slug(slug):
     return bool(slug) and bool(SLUG_PATTERN.match(slug))
 
 
-# --------------------------------------------------------------- Sofascore
+# --------------------------------------------------------------- LiveScore
 #
 # The second source, for the competitions ESPN does not carry. Everything below
 # ends in the same match dictionary parse_event builds, so nothing downstream -
 # the sorting, the goal diff, the QML - knows there are two providers.
 
 
-def sofa_season(tournament_id, cache_dir, deadline=None):
-    """The season the current round sits in, cached for half a day."""
-    key = str(tournament_id)
-    path = os.path.join(cache_dir or ".", SOFA_SEASON_CACHE)
-    cached = load_cache(path)
-    entry = cached.get(key) if isinstance(cached, dict) else None
-    if isinstance(entry, dict):
-        try:
-            fresh = time.time() - float(entry.get("at") or 0) < SOFA_SEASON_AGE
-        except (TypeError, ValueError):
-            fresh = False
-        if fresh and entry.get("season") is not None:
-            return entry["season"]
-
+def ls_events(slug, deadline=None):
+    """Every fixture of the competition's current season, one request."""
     payload = read_json_url(
-        "%s/unique-tournament/%s/seasons" % (SOFA_API, tournament_id), deadline
+        "%s/stage/soccer/%s/0?MD=1" % (LS_API, LS_STAGES[slug]), deadline
     )
-    seasons = payload.get("seasons") or []
-    if not seasons:
-        return None
-    season = seasons[0].get("id")
-    if season is None:
-        return None
-    if cache_dir:
-        cached = cached if isinstance(cached, dict) else {}
-        cached[key] = {"season": season, "at": int(time.time())}
-        try:
-            write_json_atomic(path, cached)
-        except OSError:
-            pass
-    return season
+    stages = payload.get("Stages") or []
+    return (stages[0].get("Events") or []) if stages else []
 
 
-# Sofascore's status.type, in the vocabulary the rest of the file speaks. The
-# names are ESPN's, because Model.js reads them to tell a goalless draw from a
-# match that was never played.
-SOFA_STATES = {
-    "inprogress": ("in", "STATUS_IN_PROGRESS"),
-    "notstarted": ("pre", "STATUS_SCHEDULED"),
-    "finished": ("post", "STATUS_FULL_TIME"),
-    "postponed": ("post", "STATUS_POSTPONED"),
-    "canceled": ("post", "STATUS_CANCELED"),
-    "cancelled": ("post", "STATUS_CANCELED"),
+# LiveScore's Eps for a match that is not simply before, during or after, in
+# the vocabulary the rest of the file speaks. The names are ESPN's, because
+# Model.js reads them to tell a goalless draw from a match never played.
+LS_SPECIAL_STATES = {
+    "HT": ("in", "STATUS_HALFTIME"),
+    "Postp.": ("post", "STATUS_POSTPONED"),
+    "Canc.": ("post", "STATUS_CANCELED"),
+    "Aband.": ("post", "STATUS_ABANDONED"),
+    "Abd": ("post", "STATUS_ABANDONED"),
     # Stopped but not over, and the score still stands. Not ABANDONED: Model.js
     # reads that word as a match that was never played and prints a dash where
     # the score should be, on a row still sitting under LIVE.
-    "interrupted": ("in", "STATUS_SUSPENDED"),
-    "suspended": ("in", "STATUS_SUSPENDED"),
-    "abandoned": ("post", "STATUS_ABANDONED"),
-    "willcontinue": ("in", "STATUS_IN_PROGRESS"),
+    "Susp.": ("in", "STATUS_SUSPENDED"),
+    "Int.": ("in", "STATUS_SUSPENDED"),
 }
 
+# Epr: 0 not started, 1 running, 2 over; the rest back up the labels above
+# should one of them ever be spelled differently.
+LS_PHASES = {
+    1: ("in", "STATUS_IN_PROGRESS"),
+    2: ("post", "STATUS_FULL_TIME"),
+    3: ("post", "STATUS_CANCELED"),
+    4: ("post", "STATUS_POSTPONED"),
+    6: ("in", "STATUS_SUSPENDED"),
+    8: ("post", "STATUS_ABANDONED"),
+}
 
-def sofa_minute(event, now=None):
-    """The running clock, as "67'" or "45'+2'".
-
-    Sofascore sends the moment the current period started and how many seconds
-    were already on the clock when it did; the minute is arithmetic from there.
-    The half is not counted while the ball is not rolling, so a break returns
-    its own label instead and Model.isBreak can tell the two apart.
-    """
-    status = event.get("status") or {}
-    description = status.get("description") or ""
-    if status.get("code") == 31 or description.lower() in ("halftime", "half time"):
-        return "HT"
-
-    clock = event.get("time") or {}
-    start = clock.get("currentPeriodStartTimestamp")
-    initial = clock.get("initial")
-    if start is None or initial is None:
-        # No minute to be had - around the whistle, or during a delay. Better
-        # blank than the period's name: Model.isBreak reads any word as the
-        # ball not rolling, and this is a match that may well be running.
-        return ""
-    elapsed = float(initial) + ((now if now is not None else time.time()) - float(start))
-    if elapsed < 0:
-        elapsed = 0.0
-    limit = clock.get("max")
-    if limit is not None and elapsed > float(limit):
-        return "%d'+%d'" % (int(limit) // 60, int(elapsed - float(limit)) // 60 + 1)
-    return "%d'" % (int(elapsed) // 60 + 1)
+# Incident types that put the ball in the net: plain, penalty, own goal. A
+# shootout kick is a type of its own and stays out, as it did with ESPN.
+LS_GOAL, LS_PENALTY_GOAL, LS_OWN_GOAL = 36, 37, 39
 
 
-def sofa_competitor(team, score):
-    colors = team.get("teamColors") or {}
-    primary = colors.get("primary") or ""
-    name = team.get("shortName") or team.get("name") or "?"
+def ls_kickoff(event):
+    """Esd is a UTC wall clock packed into digits, because the URL asks for /0."""
+    try:
+        return datetime.strptime(str(event.get("Esd")), "%Y%m%d%H%M%S").replace(
+            tzinfo=timezone.utc
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def ls_competitor(team, score):
+    name = team.get("Nm") or "?"
+    colour = team.get("firstColor") or ""
     return {
-        "id": SOFA_PREFIX + str(team.get("id") or ""),
-        "abbr": team.get("nameCode") or name[:3].upper() or "?",
+        "id": LS_PREFIX + str(team.get("ID") or ""),
+        "abbr": (team.get("Abr") or name[:3]).upper(),
         "name": name,
-        "fullName": team.get("name") or "",
-        "logo": "%s/team/%s/image" % (SOFA_API, team.get("id")) if team.get("id") else "",
-        # Sofascore sends white for a club whose kit has no second colour, and
-        # a white flash on a light bar is no flash at all. Model.readableColor
-        # pushes it away from the bar, so only a missing value is dropped.
-        "color": primary if primary.startswith("#") else "",
+        "fullName": name,
+        "logo": "%s/%s" % (LS_IMAGES, team["Img"]) if team.get("Img") else "",
+        # Only the scoreboard document carries a colour, and not for every
+        # club; Model.readableColor copes with a blank one.
+        "color": "#" + colour if colour else "",
         "score": str(score) if score not in (None, "") else "",
         "winner": False,
     }
 
 
-def sofa_goals(event_id, deadline=None):
-    """The scoring plays for one match, oldest first, shaped like parse_goals."""
+def ls_goals(event_id, deadline=None):
+    """(goals, scoreboard) for one match, oldest goal first, or (None, None).
+
+    The scoreboard rather than the incidents document: same request, and it
+    also says what colours the two clubs play in, which the goal flash wants.
+    """
     try:
-        payload = read_json_url(
-            "%s/event/%s/incidents" % (SOFA_API, event_id), deadline
+        board = read_json_url(
+            "%s/scoreboard/soccer/%s?locale=en" % (LS_API, event_id), deadline
         )
     except NETWORK_ERRORS:
-        return None
+        return None, None
+    try:
+        return ls_parse_goals(board), board
+    except (AttributeError, TypeError, KeyError, IndexError, ValueError):
+        # A document in a shape this does not know costs the scorers, not the
+        # sweep: an exception here would sink every competition's results.
+        return None, None
+
+
+def ls_parse_goals(board):
+    incidents = []
+    periods = board.get("Incs-s") or {}
+    for period in sorted(periods, key=lambda key: int(key) if key.isdigit() else 99):
+        for incident in periods[period] or []:
+            # A goal and its assist arrive grouped under one entry.
+            incidents.extend(incident.get("Incs") or [incident])
 
     goals = []
-    # Sofascore lists the newest incident first; the goal keys downstream count
-    # a side's goals in order, so they have to be turned round.
-    for incident in reversed(payload.get("incidents") or []):
-        if incident.get("incidentType") != "goal":
+    for incident in incidents:
+        kind = incident.get("IT")
+        if kind not in (LS_GOAL, LS_PENALTY_GOAL, LS_OWN_GOAL):
             continue
-        kind = incident.get("incidentClass") or ""
-        if kind == "penaltyShootout":
-            continue
-        player = incident.get("player") or {}
-        minute = incident.get("time")
-        added = incident.get("addedTime")
+        minute = incident.get("Min")
+        added = incident.get("MinEx")
         if minute is None:
             label = ""
         elif added:
@@ -728,32 +705,37 @@ def sofa_goals(event_id, deadline=None):
         goals.append(
             {
                 "minute": label,
-                # Filled in by sofa_event, which is where the two club ids are.
+                # Filled in by ls_event, which is where the two club ids are.
                 "team": "",
-                "scorer": player.get("shortName") or player.get("name") or "",
-                "ownGoal": kind == "ownGoal",
-                "penalty": kind == "penalty",
-                "isHome": bool(incident.get("isHome")),
+                "scorer": incident.get("Pn") or incident.get("Ln") or "",
+                "ownGoal": kind == LS_OWN_GOAL,
+                "penalty": kind == LS_PENALTY_GOAL,
+                # Nm is the side the goal counts for, own goals included.
+                "isHome": incident.get("Nm") == 1,
             }
         )
     return goals
 
 
-def sofa_event(event, slug, league_name, goals):
-    home_team = event.get("homeTeam") or {}
-    away_team = event.get("awayTeam") or {}
-    if not home_team.get("id") or not away_team.get("id"):
+def ls_event(event, slug, league_name, goals, board=None):
+    """One match; `board`, when fetched, lends the clubs their colours."""
+    home_team = (event.get("T1") or [{}])[0]
+    away_team = (event.get("T2") or [{}])[0]
+    if not home_team.get("ID") or not away_team.get("ID"):
         return None
+    if board:
+        home_team = dict(home_team, **((board.get("T1") or [{}])[0]))
+        away_team = dict(away_team, **((board.get("T2") or [{}])[0]))
 
-    status = event.get("status") or {}
-    state, status_name = SOFA_STATES.get(
-        (status.get("type") or "").lower(), ("pre", "STATUS_SCHEDULED")
+    label = event.get("Eps") or ""
+    state, status_name = LS_SPECIAL_STATES.get(label) or LS_PHASES.get(
+        event.get("Epr"), ("pre", "STATUS_SCHEDULED")
     )
-    home = sofa_competitor(home_team, (event.get("homeScore") or {}).get("current"))
-    away = sofa_competitor(away_team, (event.get("awayScore") or {}).get("current"))
+    home = ls_competitor(home_team, event.get("Tr1"))
+    away = ls_competitor(away_team, event.get("Tr2"))
 
-    # The incidents endpoint says which side a goal counts for, not which club
-    # id; both are known only here, where the two teams are.
+    # The scoreboard says which side a goal counts for, not which club id;
+    # both are known only here, where the two teams are.
     resolved = []
     for goal in goals or []:
         entry = dict(goal)
@@ -764,31 +746,26 @@ def sofa_event(event, slug, league_name, goals):
         entry["team"] = home["id"] if entry.get("isHome") else away["id"]
         resolved.append(entry)
 
-    kickoff = event.get("startTimestamp")
-    when = (
-        datetime.fromtimestamp(kickoff, timezone.utc) if kickoff else None
-    )
-    if state == "in":
-        short = sofa_minute(event)
-    elif state == "post":
-        short = "FT" if status_name == "STATUS_FULL_TIME" else (
-            status.get("description") or ""
-        )
-    else:
+    when = ls_kickoff(event)
+    if state == "pre":
         short = when.astimezone().strftime("%H:%M") if when else ""
+    else:
+        # Already the bar's vocabulary: "67'", "45+2'", "HT", "FT", "AET".
+        short = label
 
     return {
-        "id": SOFA_PREFIX + str(event.get("id") or ""),
+        "id": LS_PREFIX + str(event.get("Eid") or ""),
         "league": slug,
         "leagueName": league_name,
         "state": state,
         "statusName": status_name,
         "statusShort": short,
-        "statusDetail": status.get("description") or "",
+        "statusDetail": label,
         "clock": short if state == "in" else "",
-        "period": 2 if (event.get("lastPeriod") or "") == "period2" else 1,
+        # Nothing reads it; kept so both sources build the same dictionary.
+        "period": 0,
         "kickoff": when.isoformat() if when else "",
-        "kickoffEpoch": int(kickoff) if kickoff else 0,
+        "kickoffEpoch": int(when.timestamp()) if when else 0,
         "kickoffLocal": when.astimezone().strftime("%H:%M") if when else "",
         "note": "",
         "goals": resolved,
@@ -797,27 +774,18 @@ def sofa_event(event, slug, league_name, goals):
     }
 
 
-def fetch_sofascore_league(slug, deadline=None, cache_dir=None, previous=None):
+def goal_total(match):
+    try:
+        return int(match["home"]["score"] or 0) + int(match["away"]["score"] or 0)
+    except ValueError:
+        return -1
+
+
+def fetch_livescore_league(slug, deadline=None, previous=None):
     """Return (slug, name, matches, error), same contract as fetch_league."""
     name = COMPETITION_LABELS.get(slug, slug)
-    tournament = SOFA_TOURNAMENTS[slug]
     try:
-        season = sofa_season(tournament, cache_dir, deadline)
-        if season is None:
-            return slug, name, [], "no current season"
-        # Two windows rather than a fixture list for a date: the round that has
-        # been played and the one coming, which between them always contain
-        # today whatever day of the week it is.
-        events = {}
-        for window in ("last", "next"):
-            payload = read_json_url(
-                "%s/unique-tournament/%s/season/%s/events/%s/0"
-                % (SOFA_API, tournament, season, window),
-                deadline,
-            )
-            for event in payload.get("events") or []:
-                if event.get("id"):
-                    events[event["id"]] = event
+        events = ls_events(slug, deadline)
     except NETWORK_ERRORS as error:
         return slug, name, [], str(error)
     except Exception as error:  # noqa: BLE001 - one league must not sink the run
@@ -832,9 +800,9 @@ def fetch_sofascore_league(slug, deadline=None, cache_dir=None, previous=None):
     now = time.time()
     matches = []
     detailed = 0
-    for event in events.values():
+    for event in events:
         try:
-            skeleton = sofa_event(event, slug, name, None)
+            skeleton = ls_event(event, slug, name, None)
         except (AttributeError, TypeError, KeyError, IndexError, ValueError):
             continue
         if skeleton is None or not is_today(skeleton, today, now):
@@ -844,7 +812,6 @@ def fetch_sofascore_league(slug, deadline=None, cache_dir=None, previous=None):
         # cannot have grown a goal since the last sweep. Without this a Sunday
         # afternoon of nine finished matches paid for nine requests every
         # twenty seconds to be told the same thing.
-        goals = None
         prior = before.get(skeleton["id"])
         prior_goals = prior.get("goals") if prior else None
         # A goal is only reusable if it still says which side it was for. One
@@ -853,113 +820,110 @@ def fetch_sofascore_league(slug, deadline=None, cache_dir=None, previous=None):
         # fetched again - the cache would keep the mistake indefinitely.
         if prior_goals and not all("isHome" in goal for goal in prior_goals):
             prior_goals = None
-        if prior_goals and scoreline_of(prior) == scoreline_of(skeleton):
-            goals = prior_goals
-        elif skeleton["state"] != "pre" and detailed < SOFA_MAX_DETAIL:
+        # The score can move a sweep before the scorer is written down, and a
+        # list one goal short would otherwise be reused for the rest of the
+        # match, since the scoreline it was fetched at no longer moves.
+        reused = (
+            isinstance(prior_goals, list)
+            and scoreline_of(prior) == scoreline_of(skeleton)
+            and len(prior_goals) == goal_total(skeleton)
+        )
+        # Whatever is not fetched below keeps what the last sweep had: an
+        # empty goal list written to the cache is a match whose goals are all
+        # new again the moment the next request succeeds.
+        goals = prior_goals
+        board = None
+        if not reused and skeleton["state"] != "pre" and detailed < LS_MAX_DETAIL:
             detailed += 1
-            goals = sofa_goals(str(event["id"]), deadline)
-            # One failed request must not empty the match: an empty goal list
-            # written to the cache is a match whose goals are all new again the
-            # moment the next request succeeds.
-            if goals is None:
-                goals = prior_goals
-        if goals:
-            skeleton = sofa_event(event, slug, name, goals) or skeleton
+            fetched, board = ls_goals(str(event["Eid"]), deadline)
+            if fetched is not None:
+                goals = fetched
+        if goals or board:
+            try:
+                skeleton = ls_event(event, slug, name, goals, board) or skeleton
+            except (AttributeError, TypeError, KeyError, IndexError, ValueError):
+                pass
+        if not board and prior:
+            # Only the scoreboard carries the colours; keep the last ones seen.
+            for side in ("home", "away"):
+                skeleton[side]["color"] = (prior.get(side) or {}).get("color") or ""
         matches.append(skeleton)
     return slug, name, matches, None
 
 
-def fetch_sofascore_stats(event_id, deadline=None):
-    """Per-team numbers for one Sofascore match, in SUMMARY_STATS' vocabulary."""
+def fetch_livescore_stats(event_id, deadline=None):
+    """Per-team numbers for one LiveScore match, in SUMMARY_STATS' vocabulary."""
     try:
         payload = read_json_url(
-            "%s/event/%s/statistics" % (SOFA_API, event_id), deadline
+            "%s/statistics/soccer/%s?locale=en" % (LS_API, event_id), deadline
         )
-        event = read_json_url("%s/event/%s" % (SOFA_API, event_id), deadline)
+        board = read_json_url(
+            "%s/scoreboard/soccer/%s?locale=en" % (LS_API, event_id), deadline
+        )
     except NETWORK_ERRORS:
         return None
 
-    periods = payload.get("statistics") or []
-    if not periods:
-        return None
-    values = {}
-    for group in periods[0].get("groups") or []:
-        for item in group.get("statisticsItems") or []:
-            key = SOFA_STAT_KEYS.get(item.get("key"))
-            if key and key not in values:
-                values[key] = (item.get("home"), item.get("away"))
-
-    detail = event.get("event") or {}
-    home_id = str((detail.get("homeTeam") or {}).get("id") or "")
-    away_id = str((detail.get("awayTeam") or {}).get("id") or "")
+    home_id = str(((board.get("T1") or [{}])[0]).get("ID") or "")
+    away_id = str(((board.get("T2") or [{}])[0]).get("ID") or "")
     # Without both, the two sides would share one key and the panel would draw
     # a table of labels with no numbers under them.
     if not home_id or not away_id or home_id == away_id:
         return None
-    home_id = SOFA_PREFIX + home_id
-    away_id = SOFA_PREFIX + away_id
+    sides = {1: LS_PREFIX + home_id, 2: LS_PREFIX + away_id}
 
-    def cell(value):
-        # Zero is a number: "or" would turn a side's 0 corners into a blank
-        # where the other side shows a figure.
-        if value is None or value == "":
-            return ""
-        # Possession arrives as "64%" and the panel adds the sign itself.
-        return str(value).replace("%", "")
-
-    by_id = {home_id: {}, away_id: {}}
-    rows = []
-    for key, label, suffix in SUMMARY_STATS:
-        pair = values.get(key)
-        if pair is None:
+    by_id = {sides[1]: {}, sides[2]: {}}
+    for team in payload.get("Stat") or []:
+        side = sides.get(team.get("Tnb"))
+        if side is None:
             continue
-        by_id[home_id][key] = cell(pair[0])
-        by_id[away_id][key] = cell(pair[1])
-        rows.append({"key": key, "label": label, "suffix": suffix})
+        for key, source in LS_STAT_KEYS.items():
+            # Zero is a number: a missing figure is a blank, a 0 stays a 0.
+            parts = [team.get(field) for field in source]
+            try:
+                by_id[side][key] = str(sum(int(part) for part in parts))
+            except (TypeError, ValueError):
+                continue
 
+    rows = [
+        {"key": key, "label": label, "suffix": suffix}
+        for key, label, suffix in SUMMARY_STATS
+        if key in by_id[sides[1]] or key in by_id[sides[2]]
+    ]
     if not rows:
         return None
     return {
-        "matchId": SOFA_PREFIX + str(event_id),
+        "matchId": LS_PREFIX + str(event_id),
         "at": int(time.time()),
         "teams": by_id,
         "rows": rows,
     }
 
 
-def fetch_sofascore_teams(slug, cache_dir=None):
-    """The club picker's options for a Sofascore competition."""
-    tournament = SOFA_TOURNAMENTS[slug]
+def fetch_livescore_teams(slug):
+    """The club picker's options, read off the season's own fixture list."""
     try:
-        season = sofa_season(tournament, cache_dir)
-        if season is None:
-            return []
-        payload = read_json_url(
-            "%s/unique-tournament/%s/season/%s/teams" % (SOFA_API, tournament, season)
-        )
+        events = ls_events(slug)
     except NETWORK_ERRORS:
         return []
     league = COMPETITION_LABELS.get(slug, slug)
-    teams = []
-    for team in payload.get("teams") or []:
-        if not team.get("id"):
-            continue
-        teams.append(
-            {
-                "value": SOFA_PREFIX + str(team["id"]),
-                "label": team.get("name") or team.get("shortName") or "?",
-                "description": league,
-            }
-        )
-    return teams
+    teams = {}
+    for event in events:
+        for team in (event.get("T1") or []) + (event.get("T2") or []):
+            if team.get("ID"):
+                teams[team["ID"]] = {
+                    "value": LS_PREFIX + str(team["ID"]),
+                    "label": team.get("Nm") or "?",
+                    "description": league,
+                }
+    return sorted(teams.values(), key=lambda team: team["label"])
 
 
-def fetch_league(slug, deadline=None, cache_dir=None, previous=None):
+def fetch_league(slug, deadline=None, previous=None):
     """Return (slug, name, matches, error). An error leaves matches empty."""
     if not valid_slug(slug):
         return slug, slug, [], "not a valid competition id"
-    if slug in SOFA_TOURNAMENTS:
-        return fetch_sofascore_league(slug, deadline, cache_dir, previous)
+    if slug in LS_STAGES:
+        return fetch_livescore_league(slug, deadline, previous)
     try:
         payload = read_json_url("%s/%s/scoreboard" % (SITE_API, slug), deadline)
     except NETWORK_ERRORS as error:
@@ -1460,14 +1424,13 @@ def fetch_once(args):
     matches = []
     errors = []
     league_names = {}
-    cache_dir = os.path.dirname(args.out) or "."
     if leagues:
         workers = min(MAX_PARALLEL_REQUESTS, len(leagues))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             results = list(
                 pool.map(
                     lambda slug: fetch_league(
-                        slug, deadline, cache_dir, previous_by_league.get(slug)
+                        slug, deadline, previous_by_league.get(slug)
                     ),
                     leagues,
                 )
@@ -1612,9 +1575,9 @@ def command_leagues(_args):
     return 0
 
 
-def fetch_teams(slug, cache_dir=None):
-    if slug in SOFA_TOURNAMENTS:
-        return fetch_sofascore_teams(slug, cache_dir)
+def fetch_teams(slug):
+    if slug in LS_STAGES:
+        return fetch_livescore_teams(slug)
     try:
         payload = read_json_url("%s/%s/teams" % (SITE_API, slug))
     except NETWORK_ERRORS:
@@ -1655,8 +1618,7 @@ def command_teams(args):
     if leagues:
         workers = min(MAX_PARALLEL_REQUESTS, len(leagues))
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            fetch = lambda slug: fetch_teams(slug, os.path.dirname(args.out) or ".")
-            for teams in pool.map(fetch, leagues):
+            for teams in pool.map(fetch_teams, leagues):
                 for team in teams:
                     # A club in two competitions is listed once, under the first.
                     by_id.setdefault(team["value"], team)

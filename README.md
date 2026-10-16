@@ -106,11 +106,11 @@ blanking the bar. Only today's fixtures are kept, plus anything still being
 played.
 
 Ekstraklasa is the one exception. ESPN publishes 219 soccer competitions and
-not one of them is Polish, so `pol.1` is served by Sofascore's public endpoints
-instead - also undocumented, also no key. It costs a little more per sweep: two
-requests for the round, plus one for the scorers of any match whose score has
-moved since the last one. A scoreline that has not moved cannot have grown a
-goal, so in the steady state it is the two. Everything the second source
+not one of them is Polish, so `pol.1` is served by LiveScore's public endpoints
+instead - also undocumented, also no key. It costs a little more per sweep: one
+request for the season's fixtures, plus one for the scorers of any match whose
+score has moved since the last one. A scoreline that has not moved cannot have
+grown a goal, so in the steady state it is the one. Everything the second source
 returns is folded into the same shape as the first, so a Polish row on the card
 reads exactly like an English one.
 
@@ -231,5 +231,5 @@ Middle-clicking the bar widget also forces a refresh.
 
 ## Licence
 
-MIT. Not affiliated with ESPN or Sofascore; it reads the same public endpoints
+MIT. Not affiliated with ESPN or LiveScore; it reads the same public endpoints
 a browser does.
