@@ -35,6 +35,249 @@ Panel {
   readonly property string expandedMatch: hostWidget ? hostWidget.expandedMatch : ""
   readonly property var alertMatches: hostWidget ? hostWidget.alertMatches : []
 
+  // Local Stremio football bridge (`stremio-football-board.service`) that maps
+  // live matches to playable HLS streams for one-click playback in MPV.
+  readonly property bool stremioEnabled: hostWidget ? hostWidget.stremioEnabled : false
+  readonly property string stremioPlayer: hostWidget ? hostWidget.stremioPlayer : "mpv"
+  readonly property string streamApiBase: {
+    var raw = (hostWidget && hostWidget.stremioUrl) ? String(hostWidget.stremioUrl).trim() : "http://127.0.0.1:7040"
+    if (/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(raw)) return raw.replace(/\/$/, "")
+    return "http://127.0.0.1:7040"
+  }
+  property var streamMatches: ({})
+  property string streamMatchesStamp: ""
+  property bool streamBridgeOnline: false
+  property int streamBridgeCount: 0
+  property string streamBridgeNotice: ""
+  property string launchingMatchId: ""
+  property var expandedStreams: []
+  property string expandedStreamsStamp: ""
+  property string expandedStreamsMatchId: ""
+  property bool loadingExpandedStreams: false
+
+  function validStreamUrl(u) {
+    if (typeof u !== "string") return false
+    var s = u.trim()
+    return s.length > 0 && s.length < 2048 && /^https?:\/\//i.test(s)
+  }
+
+  function checkStreamBridge() {
+    if (!root.stremioEnabled) return
+    var xhr = new XMLHttpRequest()
+    xhr.open("GET", root.streamApiBase + "/health")
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState !== XMLHttpRequest.DONE || !root) return
+      if (xhr.status === 200) {
+        try {
+          var parsed = JSON.parse(xhr.responseText)
+          if (parsed && parsed.ok) {
+            root.streamBridgeOnline = true
+            root.streamBridgeCount = Number(parsed.matches || 0)
+            root.streamBridgeNotice = String(parsed.notice || "").slice(0, 120)
+            return
+          }
+        } catch (err) {}
+      }
+      root.streamBridgeOnline = false
+      root.streamBridgeCount = 0
+      root.streamBridgeNotice = ""
+    }
+    xhr.send()
+  }
+
+  function refreshStreamMatches() {
+    if (!root.stremioEnabled) {
+      root.streamMatches = ({})
+      root.expandedStreams = []
+      root.loadingExpandedStreams = false
+      return
+    }
+    var list = root.matches || []
+    if (list.length === 0) {
+      root.streamMatches = ({})
+      return
+    }
+    var payload = []
+    for (var i = 0; i < list.length && payload.length < 200; i++) {
+      var m = list[i]
+      if (!m || !m.id || !m.home || !m.away) continue
+      payload.push({
+        id: String(m.id),
+        home: String(m.home.name || ""),
+        homeFull: String(m.home.fullName || ""),
+        away: String(m.away.name || ""),
+        awayFull: String(m.away.fullName || "")
+      })
+    }
+    var xhr = new XMLHttpRequest()
+    xhr.open("POST", root.streamApiBase + "/api/resolve")
+    xhr.setRequestHeader("Content-Type", "application/json")
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState !== XMLHttpRequest.DONE || !root) return
+      if (xhr.status === 200) {
+        try {
+          var parsed = JSON.parse(xhr.responseText)
+          if (parsed && parsed.resolved) {
+            root.streamBridgeOnline = true
+            root.streamBridgeNotice = String(parsed.notice || "").slice(0, 120)
+            var nextStamp = JSON.stringify(parsed.resolved)
+            if (nextStamp !== root.streamMatchesStamp) {
+              root.streamMatchesStamp = nextStamp
+              root.streamMatches = parsed.resolved
+            }
+            if (root.expandedMatch !== "" && root.expandedStreamsMatchId !== root.expandedMatch) {
+              root.fetchExpandedStreams(root.expandedMatch)
+            }
+            return
+          }
+        } catch (err) {}
+      }
+      root.streamBridgeOnline = false
+      root.streamBridgeNotice = ""
+      if (root.streamMatchesStamp !== "{}") {
+        root.streamMatchesStamp = "{}"
+        root.streamMatches = ({})
+      }
+    }
+    xhr.send(JSON.stringify({ matches: payload }))
+  }
+
+  function fetchExpandedStreams(matchId) {
+    if (!root.stremioEnabled || !matchId) {
+      root.expandedStreams = []
+      root.expandedStreamsStamp = ""
+      root.expandedStreamsMatchId = ""
+      root.loadingExpandedStreams = false
+      return
+    }
+    var entry = root.streamMatches[matchId]
+    if (!entry || !entry.streamMatchId) {
+      root.expandedStreams = []
+      root.expandedStreamsStamp = ""
+      root.expandedStreamsMatchId = ""
+      root.loadingExpandedStreams = false
+      return
+    }
+    var switching = root.expandedStreamsMatchId !== matchId
+    if (switching) {
+      root.expandedStreams = []
+      root.expandedStreamsStamp = ""
+      root.loadingExpandedStreams = true
+    }
+    var requestedId = matchId
+    var xhr = new XMLHttpRequest()
+    xhr.open("GET", root.streamApiBase + "/api/streams/" + encodeURIComponent(entry.streamMatchId))
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState !== XMLHttpRequest.DONE || !root) return
+      if (root.expandedMatch !== requestedId) return
+      root.loadingExpandedStreams = false
+      if (xhr.status !== 200) return
+      try {
+        var parsed = JSON.parse(xhr.responseText)
+        var list = parsed && parsed.streams ? parsed.streams : []
+        var clean = []
+        for (var i = 0; i < list.length && clean.length < 8; i++) {
+          var s = list[i]
+          if (!s || !root.validStreamUrl(s.url)) continue
+          clean.push({
+            name: String(s.name || "Stream").slice(0, 80),
+            title: String(s.title || "").slice(0, 120),
+            url: s.url.trim(),
+            isBackup: s.isBackup === true
+          })
+        }
+        root.expandedStreamsMatchId = requestedId
+        var stamp = JSON.stringify(clean)
+        if (stamp !== root.expandedStreamsStamp) {
+          root.expandedStreamsStamp = stamp
+          root.expandedStreams = clean
+        }
+      } catch (err) {}
+    }
+    xhr.send()
+  }
+
+  function launchMpvUrls(match, urls) {
+    var safe = []
+    for (var i = 0; i < urls.length; i++) {
+      if (root.validStreamUrl(urls[i])) safe.push(urls[i].trim())
+    }
+    if (safe.length === 0) return
+    var title = (match && match.home && match.away)
+      ? (String(match.home.name || "") + " vs " + String(match.away.name || ""))
+      : "Live Match"
+    Util.execArgv(["mpv", "--force-window=immediate", "--title=" + title, "--"].concat(safe))
+    root.close()
+  }
+
+  function playInMpv(match, specificUrl) {
+    if (!root.stremioEnabled || !match || !match.id) return
+    if (specificUrl && root.validStreamUrl(specificUrl)) {
+      root.launchMpvUrls(match, [specificUrl])
+      return
+    }
+    var entry = root.streamMatches[match.id]
+    if (!entry || !entry.streamMatchId) return
+    if (root.stremioPlayer === "stremio" && typeof entry.stremioUrl === "string"
+        && /^stremio:\/\/\//i.test(entry.stremioUrl)) {
+      Util.execArgv(["xdg-open", entry.stremioUrl])
+      root.close()
+      return
+    }
+    root.launchingMatchId = match.id
+    var targetId = match.id
+    var xhr = new XMLHttpRequest()
+    xhr.open("GET", root.streamApiBase + "/api/streams/" + encodeURIComponent(entry.streamMatchId))
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState !== XMLHttpRequest.DONE || !root) return
+      if (root.launchingMatchId === targetId) root.launchingMatchId = ""
+      if (xhr.status !== 200) return
+      try {
+        var parsed = JSON.parse(xhr.responseText)
+        var list = parsed && parsed.streams ? parsed.streams : []
+        var urls = []
+        for (var i = 0; i < list.length && urls.length < 6; i++) {
+          if (list[i] && root.validStreamUrl(list[i].url)) urls.push(list[i].url.trim())
+        }
+        if (urls.length > 0) root.launchMpvUrls(match, urls)
+      } catch (err) {}
+    }
+    xhr.send()
+  }
+
+  onOpenedChanged: {
+    if (opened && root.stremioEnabled) {
+      root.refreshStreamMatches()
+      if (root.tab === "stremio") root.checkStreamBridge()
+    }
+  }
+
+  onMatchesChanged: {
+    if (root.opened && root.stremioEnabled) root.refreshStreamMatches()
+  }
+
+  onStremioEnabledChanged: {
+    if (root.stremioEnabled) {
+      if (root.opened) root.refreshStreamMatches()
+      root.checkStreamBridge()
+    } else {
+      if (root.tab === "stremio") root.tab = "settings"
+      root.streamMatches = ({})
+      root.streamMatchesStamp = ""
+      root.streamBridgeOnline = false
+      root.streamBridgeCount = 0
+      root.streamBridgeNotice = ""
+      root.expandedStreams = []
+      root.expandedStreamsStamp = ""
+      root.expandedStreamsMatchId = ""
+      root.loadingExpandedStreams = false
+    }
+  }
+
+  onExpandedMatchChanged: {
+    root.fetchExpandedStreams(root.expandedMatch)
+  }
+
 
   // The bar shows one match; goal alerts can cover as many as you like.
   function toggleAlert(id) {
@@ -77,6 +320,7 @@ Panel {
   // click at the bottom: that had to be found first, and it moved whenever the
   // list above it changed.
   property string tab: "matches"
+  readonly property bool stremioOpen: tab === "stremio"
   readonly property bool settingsOpen: tab === "settings"
 
   // Every setting goes through the widget, which writes the plugin's own
@@ -97,7 +341,7 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(480))
+    contentWidth: panel.fittedContentWidth(Style.space(root.stremioEnabled ? 508 : 480))
     contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(620))
 
     PanelKeyCatcher {
@@ -179,10 +423,16 @@ Panel {
               spacing: Style.space(6)
 
               Repeater {
-                model: [
-                  { key: "matches", label: "MATCHES" },
-                  { key: "settings", label: "SETTINGS" }
-                ]
+                model: root.stremioEnabled
+                  ? [
+                      { key: "matches", label: "MATCHES" },
+                      { key: "stremio", label: "STREMIO" },
+                      { key: "settings", label: "SETTINGS" }
+                    ]
+                  : [
+                      { key: "matches", label: "MATCHES" },
+                      { key: "settings", label: "SETTINGS" }
+                    ]
 
                 Item {
                   required property var modelData
@@ -200,16 +450,30 @@ Panel {
                           : "transparent")
                   }
 
-                  Text {
+                  Row {
                     id: tabLabel
                     anchors.centerIn: parent
-                    textFormat: Text.PlainText
-                    text: parent.modelData.label
-                    color: parent.current ? Color.accent : root.dim
-                    font.family: root.uiFont
-                    font.pixelSize: Style.font.caption
-                    font.bold: true
-                    font.letterSpacing: 1.6
+                    spacing: Style.space(5)
+
+                    Text {
+                      anchors.verticalCenter: parent.verticalCenter
+                      textFormat: Text.PlainText
+                      text: parent.parent.modelData.label
+                      color: parent.parent.current ? Color.accent : root.dim
+                      font.family: root.uiFont
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                      font.letterSpacing: 1.6
+                    }
+
+                    Rectangle {
+                      visible: parent.parent.modelData.key === "stremio" && root.streamBridgeNotice !== ""
+                      anchors.verticalCenter: parent.verticalCenter
+                      width: Style.space(6)
+                      height: width
+                      radius: width / 2
+                      color: "#eb5757"
+                    }
                   }
 
                   MouseArea {
@@ -222,6 +486,7 @@ Panel {
                       // The open card is destroyed with the list, so stop
                       // fetching its numbers too.
                       if (root.tab !== "matches") root.setExpanded("", "")
+                      if (root.tab === "stremio") root.checkStreamBridge()
                     }
                   }
                 }
@@ -238,6 +503,39 @@ Panel {
             color: Color.accent
             font.family: root.uiFont
             font.pixelSize: Style.font.caption
+          }
+
+          Rectangle {
+            width: parent.width
+            visible: root.tab === "matches" && root.stremioEnabled && root.streamBridgeNotice !== ""
+            implicitHeight: noticeText.implicitHeight + Style.space(10)
+            radius: Style.cornerRadius
+            color: Qt.rgba(0.92, 0.34, 0.34, 0.14)
+
+            Text {
+              id: noticeText
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.leftMargin: Style.space(8)
+              anchors.rightMargin: Style.space(8)
+              textFormat: Text.PlainText
+              text: "Stremio: " + root.streamBridgeNotice
+              elide: Text.ElideRight
+              color: "#eb5757"
+              font.family: root.uiFont
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: {
+                root.tab = "stremio"
+                root.checkStreamBridge()
+              }
+            }
           }
 
           Text {
@@ -257,8 +555,9 @@ Panel {
             width: parent.width
             visible: root.tab === "matches" && root.matches.length > 0
             textFormat: Text.PlainText
-            text: "Click a match for its numbers. The eye picks the one the bar "
-              + "shows, the bell adds it to the goal alerts."
+            text: root.stremioEnabled
+              ? "Click a match for its numbers. Eye pins to bar, bell adds goal alerts, play opens in MPV."
+              : "Click a match for its numbers. The eye picks the one the bar shows, the bell adds it to the goal alerts."
             wrapMode: Text.WordWrap
             color: root.dim
             font.family: root.uiFont
@@ -290,6 +589,8 @@ Panel {
                   readonly property bool pinned: root.pinnedMatch === modelData.id
                   readonly property bool expanded: root.expandedMatch === modelData.id
                   readonly property bool alerted: root.alertMatches.indexOf(modelData.id) !== -1
+                  readonly property bool hasStream: Boolean(root.streamMatches && root.streamMatches[modelData.id])
+                  readonly property bool launching: root.launchingMatchId === modelData.id
                   // Nothing left to follow or be told about, so neither switch
                   // has any work to do - unless it is already on, in which case
                   // it stays until it is turned off, or the row would carry a
@@ -333,6 +634,11 @@ Panel {
                         } else if (event.x < bellSlot.x + bellSlot.width) {
                           if (bellSlot.visible) {
                             root.toggleAlert(row.modelData.id)
+                            return
+                          }
+                        } else if (event.x < playSlot.x + playSlot.width) {
+                          if (playSlot.visible) {
+                            root.playInMpv(row.modelData, "")
                             return
                           }
                         }
@@ -427,9 +733,41 @@ Panel {
                       }
                     }
 
+                    Item {
+                      id: playSlot
+                      anchors.left: bellSlot.right
+                      anchors.leftMargin: root.stremioEnabled ? Style.space(2) : 0
+                      anchors.verticalCenter: parent.verticalCenter
+                      width: root.stremioEnabled ? Style.space(24) : 0
+                      height: eyeSlot.height
+                      visible: root.stremioEnabled && !row.finished && row.hasStream
+
+                      Rectangle {
+                        anchors.centerIn: parent
+                        width: Math.min(parent.width, parent.height)
+                        height: width
+                        radius: Style.cornerRadius
+                        visible: row.launching || rowHover.containsMouse
+                        color: row.launching
+                          ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.30)
+                          : Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.14)
+                      }
+
+                      Text {
+                        anchors.centerIn: parent
+                        textFormat: Text.PlainText
+                        text: "\uf04b"
+                        color: (row.launching || rowHover.containsMouse)
+                          ? Color.accent
+                          : Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.72)
+                        font.family: root.uiFont
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+
                     Text {
                       id: leagueTag
-                      anchors.left: bellSlot.right
+                      anchors.left: playSlot.right
                       anchors.leftMargin: Style.space(6)
                       anchors.verticalCenter: parent.verticalCenter
                       textFormat: Text.PlainText
@@ -523,18 +861,44 @@ Panel {
                     sourceComponent: MatchDetail {
                       match: row.modelData
                       stats: root.stats
+                      streams: (root.stremioEnabled && row.expanded) ? root.expandedStreams : []
+                      loadingStreams: root.stremioEnabled && row.expanded && root.loadingExpandedStreams
+                      hasStream: root.stremioEnabled && !row.finished && row.hasStream
                       foreground: root.fg
                       dim: root.dim
                       accent: Color.accent
                       fontFamily: root.uiFont
                       // Same left edge and same right edge as the score field
                       // above, so the minute column lines up with the score.
-                      indent: bellSlot.x + bellSlot.width + Style.space(6) + leagueTag.width
+                      indent: playSlot.x + playSlot.width + Style.space(6) + leagueTag.width
                       rightInset: clock.width + Style.space(8)
+                      onPlayStreamRequested: function (streamUrl) {
+                        root.playInMpv(row.modelData, streamUrl)
+                      }
                     }
                   }
                 }
               }
+            }
+          }
+
+          // ------------------------------------------------------------ stremio
+          Loader {
+            width: column.width
+            active: root.stremioEnabled && root.stremioOpen
+            visible: active
+            sourceComponent: StremioTab {
+              width: column.width
+              bar: root.bar
+              foreground: root.fg
+              dim: root.dim
+              fontFamily: root.uiFont
+              bridgeOnline: root.streamBridgeOnline
+              bridgeCount: root.streamBridgeCount
+              bridgeNotice: root.streamBridgeNotice
+              bridgeBaseUrl: root.streamApiBase
+              playerMode: root.stremioPlayer
+              onSettingChanged: function (key, value) { root.put(key, value) }
             }
           }
 
@@ -544,168 +908,20 @@ Panel {
             width: column.width
             active: root.settingsOpen
             visible: active
-            sourceComponent: Component {
-              Column {
-                width: parent.width
-                spacing: Style.spacing.rowGap
-
-                MultiSelect {
-                  width: parent.width
-                  label: "Competitions"
-                  values: root.leagues
-                  optionsCommand: root.helper.concat(["leagues"])
-                  // MultiSelect assigns its cwd unconditionally, and an empty
-                  // string stops the process from starting at all.
-                  optionsCommandCwd: root.pluginDir
-                  placeholderText: "Search competitions..."
-                  noSelectionText: "No competitions"
-                  foreground: root.fg
-                  accent: Color.accent
-                  fontFamily: root.uiFont
-                  onChanged: function (values) { root.put("leagues", values) }
-                }
-
-                MultiSelect {
-                  id: clubPicker
-                  width: parent.width
-                  label: "Your clubs"
-                  values: root.favorites
-                  // Teams come from the competitions that are actually
-                  // followed, read from the config by the helper itself, so
-                  // the list stays short and holds nothing that can never show
-                  // up in the panel.
-                  optionsCommand: root.helper.concat(["teams"])
-                  optionsCommandCwd: root.pluginDir
-                  placeholderText: "Search clubs..."
-                  noSelectionText: "No clubs picked"
-                  // Favourites are stored as ESPN team ids, and until the
-                  // options have been fetched there is nothing to turn them
-                  // into names with. A trigger reading "86, 359" looks like a
-                  // bug rather than a wait.
-                  triggerLabel: clubPicker.loadingOptions ? "Loading clubs…" : ""
-                  foreground: root.fg
-                  accent: Color.accent
-                  fontFamily: root.uiFont
-                  onChanged: function (values) { root.put("favoriteTeams", values) }
-                }
-
-                Dropdown {
-                  width: parent.width
-                  label: "What the bar shows"
-                  value: root.hostWidget ? root.hostWidget.barMode : "Auto"
-                  options: ["Auto", "Favorites only", "Any live match",
-                            "Picked match only"]
-                  foreground: root.fg
-                  accent: Color.accent
-                  fontFamily: root.uiFont
-                  onChanged: function (value) { root.put("barMode", value) }
-                }
-
-                Toggle {
-                  width: parent.width
-                  label: "Notify on goals"
-                  description: "A desktop notification when the score changes or a match ends."
-                  checked: root.hostWidget ? root.hostWidget.goalNotifications : true
-                  foreground: root.fg
-                  fontFamily: root.uiFont
-                  onClicked: root.put("goalNotifications",
-                    !(root.hostWidget && root.hostWidget.goalNotifications))
-                }
-
-                Toggle {
-                  width: parent.width
-                  visible: root.hostWidget ? root.hostWidget.goalNotifications : true
-                  label: "Notify for every match"
-                  description: "Off keeps the alerts to the clubs you follow."
-                  checked: root.hostWidget ? root.hostWidget.notifyAll : false
-                  foreground: root.fg
-                  fontFamily: root.uiFont
-                  onClicked: root.put("notifyAll", !(root.hostWidget && root.hostWidget.notifyAll))
-                }
-
-                Item {
-                  width: parent.width
-                  implicitHeight: testGoal.implicitHeight + Style.space(6)
-
-                  Text {
-                    id: testGoal
-                    anchors.left: parent.left
-                    anchors.verticalCenter: parent.verticalCenter
-                    textFormat: Text.PlainText
-                    text: "\uf1e3  Test the goal alert"
-                    color: testGoalHover.containsMouse ? Color.accent : root.fg
-                    font.family: root.uiFont
-                    font.pixelSize: Style.font.bodySmall
-                    font.underline: testGoalHover.containsMouse
-                  }
-
-                  MouseArea {
-                    id: testGoalHover
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.demoGoal()
-                  }
-                }
-
-                Text {
-                  width: parent.width
-                  textFormat: Text.PlainText
-                  text: "Refresh while a match is live: "
-                    + Math.round(liveSlider.liveValue) + " s"
-                  color: root.dim
-                  font.family: root.uiFont
-                  font.pixelSize: Style.font.caption
-                }
-
-                PanelSlider {
-                  id: liveSlider
-                  width: parent.width
-                  bar: root.bar
-                  // Each competition is a request, so the floor rises with the
-                  // list: twenty seconds for a couple of leagues, two minutes
-                  // for the whole picker.
-                  minimum: root.hostWidget ? root.hostWidget.minLiveRefreshSec : 20
-                  maximum: 300
-                  step: 10
-                  integer: true
-                  value: root.hostWidget ? root.hostWidget.liveRefreshSec : 60
-                  onReleased: function (v) { root.put("liveRefreshSec", Math.round(v)) }
-                }
-
-                Text {
-                  width: parent.width
-                  textFormat: Text.PlainText
-                  text: "Refresh when nothing is live: "
-                    + Math.round(idleSlider.liveValue) + " min"
-                  color: root.dim
-                  font.family: root.uiFont
-                  font.pixelSize: Style.font.caption
-                }
-
-                PanelSlider {
-                  id: idleSlider
-                  width: parent.width
-                  bar: root.bar
-                  minimum: 1
-                  maximum: 180
-                  step: 1
-                  integer: true
-                  value: root.hostWidget ? root.hostWidget.idleRefreshMin : 20
-                  onReleased: function (v) { root.put("idleRefreshMin", Math.round(v)) }
-                }
-
-                Text {
-                  width: parent.width
-                  textFormat: Text.PlainText
-                  text: "Scores come from ESPN's public scoreboard, one request per "
-                    + "competition. No account, no key."
-                  wrapMode: Text.WordWrap
-                  color: root.dim
-                  font.family: root.uiFont
-                  font.pixelSize: Style.font.caption
-                }
-              }
+            sourceComponent: SettingsTab {
+              width: column.width
+              bar: root.bar
+              hostWidget: root.hostWidget
+              leagues: root.leagues
+              favorites: root.favorites
+              helper: root.helper
+              pluginDir: root.pluginDir
+              stremioEnabled: root.stremioEnabled
+              foreground: root.fg
+              dim: root.dim
+              fontFamily: root.uiFont
+              onSettingChanged: function (key, value) { root.put(key, value) }
+              onDemoGoalRequested: root.demoGoal()
             }
           }
         }

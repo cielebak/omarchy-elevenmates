@@ -1,1347 +1,58 @@
 #!/usr/bin/env python3
-"""Score fetcher behind the Elevenmates bar widget.
-
-Talks to ESPN's public scoreboard endpoints, which need no key and no account,
-and to LiveScore for the competitions ESPN does not carry - Ekstraklasa is the
-only one so far. One request per followed competition, run in parallel, folded
-into a single cache file the QML side watches. A competition that fails keeps
-its previous matches instead of blanking the bar.
-
-Settings live in ~/.config/omarchy/elevenmates.json rather than in the widget's
-shell.json entry: `omarchy bar set` hands its value to the shell over an IPC
-call that flattens a JSON array into separate arguments, so a list of
-competitions came back as a bare string, or not at all.
+"""Score fetcher CLI behind the Elevenmates bar widget.
 
 Commands:
-  fetch    refresh the score cache [--stats <league>:<event>]
-  config   show | set <key> <json-value> | get <key>
-  leagues  print the competition picker options as JSON
-  teams    print the team picker options as JSON
+  fetch      refresh the score cache [--stats <league>:<event>]
+  config     show | set <key> <json-value> | get <key>
+  leagues    print the competition picker options as JSON
+  teams      print the team picker options as JSON
   demo-goal  fire the goal alert once
 """
 
 import argparse
-import errno
-import fcntl
-import gzip
-import http.client
-import io
 import json
 import os
-import re
-import subprocess
 import sys
-import tempfile
-import threading
 import time
-import urllib.error
-import urllib.request
-import zlib
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
-from urllib.parse import urlsplit
+from datetime import datetime
 
-# Everything a request can fail with, in one place: the pooled connections
-# raise http.client's exceptions, which are not OSErrors.
-NETWORK_ERRORS = (
-    urllib.error.URLError,
-    http.client.HTTPException,
-    OSError,
-    ValueError,
-    TimeoutError,
+from elevenmates_lib.announce import announce_changes
+from elevenmates_lib.constants import (
+    COMPETITIONS,
+    CONFIG_PATH,
+    DEFAULT_CONFIG,
+    DEMO_GOAL,
+    FETCH_BUDGET,
+    FULL_SWEEP_INTERVAL,
+    GOAL_FEED_KEEP,
+    IDLE_STRETCH_CAP,
+    LOCK_NAME,
+    MAX_PARALLEL_REQUESTS,
+    MIN_REFRESH_AGE,
+    STALE_CACHE_AGE,
+    STATE_PATH,
+    TEAMS_CACHE_AGE,
+    TEAMS_CACHE_NAME,
 )
-
-SITE_API = "https://site.api.espn.com/apis/site/v2/sports/soccer"
-
-# ESPN publishes 219 soccer competitions and not one of them is Polish, so
-# Ekstraklasa cannot come from the same place as everything else. LiveScore
-# carries it, needs no key either, and answers the three things the widget
-# actually needs: the season's fixtures with a running clock, and per match the
-# scoring plays with the scorer on them. It is an undocumented endpoint and may
-# change under us; a competition that fails keeps its previous matches, so the
-# worst case is a stale Polish row rather than a broken bar. Sofascore served
-# this until 2026-10, when it started answering 403 to anything not a browser.
-LS_API = "https://prod-cdn-public-api.livescore.com/v1/api/app"
-LS_IMAGES = "https://lsm-static-prod.livescore.com/medium"
-
-# Slug -> LiveScore stage path. Everything not listed here goes to ESPN, which
-# is still the source for the other forty-three competitions.
-LS_STAGES = {
-    "pol.1": "poland/ekstraklasa",
-}
-
-# LiveScore ids are its own numbering and would otherwise collide with ESPN's.
-# The prefix keeps favourites, pins and bells unambiguous whichever source they
-# came from. A dash rather than a colon: match ids travel through
-# `--stats <league>:<id>`.
-LS_PREFIX = "ls-"
-
-# One request per match for the scorers, so the sweep cannot grow without
-# bound on a full matchday.
-LS_MAX_DETAIL = 10
-
-CONFIG_PATH = os.path.expanduser("~/.config/omarchy/elevenmates.json")
-STATE_PATH = os.path.expanduser(
-    "~/.local/state/omarchy/elevenmates/state.json"
+from elevenmates_lib.providers import fetch_league, fetch_stats, fetch_teams
+from elevenmates_lib.storage import (
+    FetchLock,
+    as_string_list,
+    is_today,
+    load_cache,
+    load_config,
+    merge_stats,
+    sort_key,
+    write_json_atomic,
 )
-
-DEFAULT_CONFIG = {
-    "leagues": [
-        "eng.1", "esp.1", "ger.1", "ita.1", "fra.1",
-        "uefa.champions", "uefa.europa", "uefa.europa.conf",
-        "uefa.nations", "fifa.worldq.uefa",
-    ],
-    "favoriteTeams": [],
-    "pinnedMatch": "",
-    "alertMatches": [],
-    "barMode": "Auto",
-    "goalNotifications": True,
-    "notifyAll": False,
-    "liveRefreshSec": 60,
-    "idleRefreshMin": 20,
-}
-REQUEST_TIMEOUT = 12
-MAX_PARALLEL_REQUESTS = 6
-
-# A response is read in chunks against these two ceilings instead of being
-# swallowed whole. The largest document either endpoint serves is the club
-# list at 373 KB; a whole sweep of ten competitions is 70 KB compressed and
-# 742 KB expanded. Anything an order of magnitude past that is not football,
-# so the read stops there rather than letting a hostile or broken endpoint
-# dribble bytes forever or hand back a gzip bomb.
-MAX_BODY_BYTES = 4 * 1024 * 1024
-MAX_DECOMPRESSED_BYTES = 16 * 1024 * 1024
-READ_CHUNK_BYTES = 64 * 1024
-
-# What a single document may spend on the wire when nobody handed the request a
-# deadline - the club list and the season lookup. REQUEST_TIMEOUT cannot serve
-# as that budget: it is how long a quiet stretch may last, and 373 KB over a
-# tethered phone legitimately takes longer than one of those.
-UNTIMED_BODY_BUDGET = 60
-
-# The widget exists once per monitor, each with its own timer, so two fetches
-# can start within milliseconds of each other. They would double the traffic,
-# announce every goal twice and race each other's writes. One lock and one
-# freshness check collapse them into a single refresh.
-LOCK_NAME = "fetch.lock"
-MIN_REFRESH_AGE = 15
-
-# A whole sweep has to finish in bounded time even if one endpoint dribbles
-# bytes: urlopen's timeout is per socket operation, not a deadline.
-FETCH_BUDGET = 40
-
-# The club list changes about twice a year; fetching it on every visit to the
-# settings tab cost 373 KB a time.
-TEAMS_CACHE_NAME = "teams.json"
-TEAMS_CACHE_AGE = 7 * 24 * 60 * 60
-
-SLUG_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
-
-# The goal the test in settings announces. A fixture of its own rather than
-# whatever the cache happens to hold: the alert is meant to be seen in full -
-# scorer, club, colour, minute, score - and it has to work on a day with no
-# football on, which is most days for most people. Real Madrid's colour is the
-# one ESPN publishes for them.
-DEMO_GOAL = {
-    "matchId": "demo",
-    "league": "LaLiga",
-    "team": "RMA",
-    "teamName": "Real Madrid",
-    "teamColor": "#ffffff",
-    "minute": "23'",
-    "score": "1-0",
-    "home": "RMA",
-    "away": "BAR",
-}
-
-# A cache older than this was written before the machine slept. Diffing against
-# it would replay hours of football as fresh goals.
-STALE_CACHE_AGE = 20 * 60
-
-# The longest the widget ever lets itself go between sweeps: it stretches the
-# idle interval when today's card is empty and stretches it further overnight,
-# and this is where that stops. The staleness guard above has to clear it, or a
-# perfectly ordinary quiet night would be read as a suspend and the first goals
-# of the morning would go unannounced. Mirrored by IDLE_STRETCH_CAP_MS in
-# BarWidget.qml, which is the side that actually does the waiting.
-IDLE_STRETCH_CAP = 45 * 60
-
-# Goals wait their turn on the bar, so the cache carries a short feed rather
-# than only the newest one: two goals inside a single refresh interval are two
-# celebrations, not one. Deep enough for a busy Saturday minute, shallow enough
-# that a widget starting up cannot inherit a whole afternoon.
-GOAL_FEED_KEEP = 12
-
-# How long a finished match stays on today's card once its day has rolled over.
-# Model.js keeps FINISHED_GRACE_MS in step with this: a match the helper still
-# writes out but the QML side has stopped offering the bar is a card that reads
-# as stuck.
-RECENT_MATCH_AGE = 5 * 60 * 60
-
-# The open match card's numbers, kept per match. There is one widget per
-# monitor and they can have different cards open, so a single slot meant each
-# sweep overwrote the other screen's numbers and neither ever settled.
-STATS_KEEP = 4
-STATS_AGE = 15 * 60
-
-# The picker list. ESPN carries 219 soccer competitions, most of them qualifying
-# rounds and regional cups nobody scrolls past, so the widget offers a readable
-# subset. Any other slug still works if it is put into the config file by hand.
-COMPETITIONS = [
-    ("eng.1", "Premier League", "England"),
-    ("eng.2", "Championship", "England"),
-    ("eng.fa", "FA Cup", "England"),
-    ("eng.league_cup", "EFL Cup", "England"),
-    ("esp.1", "LaLiga", "Spain"),
-    ("esp.copa_del_rey", "Copa del Rey", "Spain"),
-    ("ger.1", "Bundesliga", "Germany"),
-    ("ger.2", "2. Bundesliga", "Germany"),
-    ("ger.dfb_pokal", "DFB-Pokal", "Germany"),
-    ("ita.1", "Serie A", "Italy"),
-    ("ita.coppa_italia", "Coppa Italia", "Italy"),
-    ("fra.1", "Ligue 1", "France"),
-    ("fra.coupe_de_france", "Coupe de France", "France"),
-    ("ned.1", "Eredivisie", "Netherlands"),
-    ("pol.1", "Ekstraklasa", "Poland"),
-    ("por.1", "Primeira Liga", "Portugal"),
-    ("sco.1", "Premiership", "Scotland"),
-    ("bel.1", "Pro League", "Belgium"),
-    ("tur.1", "Super Lig", "Turkey"),
-    ("gre.1", "Super League", "Greece"),
-    ("aut.1", "Bundesliga", "Austria"),
-    ("swe.1", "Allsvenskan", "Sweden"),
-    ("nor.1", "Eliteserien", "Norway"),
-    ("den.1", "Superliga", "Denmark"),
-    ("usa.1", "MLS", "United States"),
-    ("mex.1", "Liga MX", "Mexico"),
-    ("bra.1", "Brasileirao", "Brazil"),
-    ("arg.1", "Liga Profesional", "Argentina"),
-    ("ksa.1", "Saudi Pro League", "Saudi Arabia"),
-    ("uefa.champions", "Champions League", "Europe"),
-    ("uefa.champions_qual", "Champions League qualifying", "Europe"),
-    ("uefa.europa", "Europa League", "Europe"),
-    ("uefa.europa_qual", "Europa League qualifying", "Europe"),
-    ("uefa.europa.conf", "Conference League", "Europe"),
-    ("uefa.europa.conf_qual", "Conference League qualifying", "Europe"),
-    ("uefa.super_cup", "UEFA Super Cup", "Europe"),
-    ("fifa.cwc", "Club World Cup", "World"),
-    ("fifa.world", "World Cup", "National teams"),
-    ("fifa.worldq.uefa", "World Cup qualifying", "National teams, Europe"),
-    ("uefa.euro", "European Championship", "National teams"),
-    ("uefa.euroq", "European Championship qualifying", "National teams"),
-    ("uefa.nations", "Nations League", "National teams"),
-    ("uefa.euro_u21", "Euro U21", "National teams"),
-    ("fifa.friendly", "International friendlies", "National teams"),
-]
-
-COMPETITION_LABELS = {slug: label for slug, label, _ in COMPETITIONS}
-
-# Rank used when sorting the cached list: what is happening now comes first.
-STATE_ORDER = {"in": 0, "pre": 1, "post": 2}
-
-
-# One TLS handshake per worker thread rather than one per request. A sweep of
-# ten competitions paid for ten of them; with the picker's full list it was
-# forty-three. The connections belong to the thread that opened them, so no two
-# requests ever share a socket.
-_pool = threading.local()
-
-
-def take_connection(host, timeout):
-    """Return (connection, reused). A reused one may already be half dead."""
-    connections = getattr(_pool, "connections", None)
-    if connections is None:
-        connections = _pool.connections = {}
-    connection = connections.get(host)
-    reused = connection is not None
-    if connection is None:
-        connection = connections[host] = http.client.HTTPSConnection(
-            host, timeout=timeout
-        )
-    # http.client only reads its timeout when it connects, so an already open
-    # socket has to be told separately or it keeps the first call's deadline.
-    connection.timeout = timeout
-    if connection.sock is not None:
-        try:
-            connection.sock.settimeout(timeout)
-        except OSError:
-            pass
-    return connection, reused
-
-
-def drop_connection(host):
-    connections = getattr(_pool, "connections", None) or {}
-    connection = connections.pop(host, None)
-    if connection is not None:
-        try:
-            connection.close()
-        except OSError:
-            pass
-
-
-def read_body(response, deadline):
-    """The response body, bounded in bytes and in wall clock time.
-
-    response.read() with no argument keeps reading for as long as the far end
-    keeps sending: the socket timeout limits one quiet stretch, not the whole
-    transfer, so a slow trickle can outlive any deadline the sweep set itself.
-
-    read1 rather than read: read(n) waits for all n bytes and only the stream
-    ending releases it, so an endpoint dripping a byte at a time holds a single
-    call open indefinitely and neither ceiling below is ever reached. read1
-    hands over whatever has arrived, which is what makes them ceilings.
-    """
-    chunks = []
-    total = 0
-    while True:
-        if time.time() >= deadline:
-            raise TimeoutError("response body outlived its deadline")
-        chunk = response.read1(READ_CHUNK_BYTES)
-        if not chunk:
-            return b"".join(chunks)
-        total += len(chunk)
-        if total > MAX_BODY_BYTES:
-            raise ValueError("response body over %d bytes" % MAX_BODY_BYTES)
-        chunks.append(chunk)
-
-
-def gunzip_body(payload):
-    """Expand a gzip body, refusing one that expands out of all proportion."""
-    try:
-        with gzip.GzipFile(fileobj=io.BytesIO(payload)) as stream:
-            body = stream.read(MAX_DECOMPRESSED_BYTES + 1)
-    except EOFError:
-        # A body cut off mid-stream is a failed request like any other, and the
-        # sweep only knows how to keep the previous matches for those.
-        raise ValueError("response ended mid-gzip-stream")
-    except zlib.error as error:
-        # Corrupt deflate data raises outside the OSError family that the rest
-        # of the fetch treats as a network failure, so it is translated here
-        # rather than escaping every caller that only handles NETWORK_ERRORS.
-        raise ValueError("response is not readable gzip: %s" % error)
-    if len(body) > MAX_DECOMPRESSED_BYTES:
-        raise ValueError(
-            "response expands past %d bytes" % MAX_DECOMPRESSED_BYTES
-        )
-    return body
-
-
-def read_json_url(url, deadline=None):
-    """One scoreboard or summary document.
-
-    No User-Agent override on purpose: ESPN's edge answers urllib's default but
-    returns 403 for an arbitrary product token, and spoofing a browser is not
-    worth it. If this ever starts failing, the header is the first place to
-    look. Accept-Encoding is a separate header and is safe: these documents
-    compress about tenfold, which is the difference between 742 KB and 70 KB
-    for one sweep of ten competitions.
-    """
-    timeout = REQUEST_TIMEOUT
-    if deadline is not None:
-        timeout = max(1.0, min(REQUEST_TIMEOUT, deadline - time.time()))
-
-    parts = urlsplit(url)
-    host = parts.netloc
-    target = parts.path + ("?" + parts.query if parts.query else "")
-    # http.client sends no User-Agent of its own, and a request without one is
-    # answered with 403. urllib's default token is accepted, so keep sending
-    # exactly that; an arbitrary product token is refused as well.
-    headers = {
-        "User-Agent": "Python-urllib/%s" % urllib.request.__version__,
-        "Accept-Encoding": "gzip",
-        "Connection": "keep-alive",
-    }
-
-    # The same absolute deadline as the rest of the sweep, never tighter than
-    # the socket timeout above: a request whose deadline has already gone keeps
-    # the second that timeout floor leaves it rather than being sent and then
-    # having its answer thrown away unread.
-    if deadline is None:
-        body_deadline = time.time() + UNTIMED_BODY_BUDGET
-    else:
-        body_deadline = max(deadline, time.time() + timeout)
-
-    while True:
-        connection, reused = take_connection(host, timeout)
-        try:
-            connection.request("GET", target, headers=headers)
-            response = connection.getresponse()
-        except (http.client.HTTPException, OSError):
-            drop_connection(host)
-            # A kept connection the far end closed in the meantime fails before
-            # a single byte leaves, so one retry on a fresh socket is free and
-            # cannot repeat the request. A fresh socket failing is a real error.
-            if reused:
-                continue
-            raise
-
-        if response.status != 200:
-            # Nothing is pipelined here, but a connection that answered with an
-            # error is not worth keeping either.
-            drop_connection(host)
-            raise urllib.error.HTTPError(
-                url, response.status, response.reason, response.headers, None
-            )
-
-        try:
-            payload = read_body(response, body_deadline)
-        except (http.client.HTTPException, OSError, ValueError):
-            # Whatever went wrong - a limit, the deadline, a dead socket - the
-            # body is half read and the connection is out of step with the
-            # protocol, so it is closed rather than handed to the next request.
-            # No retry either: the request was answered, just not acceptably.
-            drop_connection(host)
-            raise
-        break
-
-    if response.headers.get("Content-Encoding", "").lower() == "gzip":
-        try:
-            payload = gunzip_body(payload)
-        except (OSError, ValueError):
-            drop_connection(host)
-            raise
-    return json.loads(payload.decode("utf-8"))
-
-
-def parse_kickoff(value):
-    """ESPN stamps kickoffs as 2026-09-20T13:00Z, which fromisoformat rejects."""
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
-def parse_competitor(competitor):
-    team = competitor.get("team") or {}
-    score = competitor.get("score")
-    return {
-        "id": str(team.get("id") or ""),
-        "abbr": team.get("abbreviation") or team.get("shortDisplayName") or "?",
-        "name": team.get("shortDisplayName") or team.get("displayName") or "?",
-        "fullName": team.get("displayName") or "",
-        "logo": team.get("logo") or "",
-        "color": "#" + (team.get("color") or "").lstrip("#") if team.get("color") else "",
-        "score": str(score) if score not in (None, "") else "",
-        "winner": bool(competitor.get("winner")),
-    }
-
-
-def parse_goals(competition):
-    """The scoring plays ESPN attaches to a live match, oldest first."""
-    goals = []
-    for detail in competition.get("details") or []:
-        if not detail.get("scoringPlay") or detail.get("shootout"):
-            continue
-        athletes = detail.get("athletesInvolved") or []
-        scorer = ""
-        if athletes:
-            scorer = athletes[0].get("shortName") or athletes[0].get("displayName") or ""
-        goals.append(
-            {
-                "minute": (detail.get("clock") or {}).get("displayValue") or "",
-                "team": str((detail.get("team") or {}).get("id") or ""),
-                "scorer": scorer,
-                "ownGoal": bool(detail.get("ownGoal")),
-                "penalty": bool(detail.get("penaltyKick")),
-            }
-        )
-    return goals
-
-
-def goal_keys(match_id, goals):
-    """Stable identifiers for a match's goals.
-
-    Keying on the scorer and the minute looked obvious and was wrong: ESPN
-    publishes a scoring play with the name missing and fills it in a refresh or
-    two later, and revises "45'" to "45'+2'". Either rewrote the key and the
-    same goal was announced twice. The n-th goal for a side stays the n-th.
-    """
-    seen = {}
-    keys = []
-    for goal in goals:
-        team = goal.get("team", "")
-        seen[team] = seen.get(team, 0) + 1
-        keys.append("%s|%s|%s" % (match_id, team, seen[team]))
-    return keys
-
-
-def parse_event(event, league_slug, league_name):
-    competition = (event.get("competitions") or [{}])[0]
-    competitors = competition.get("competitors") or []
-    home = next((c for c in competitors if c.get("homeAway") == "home"), None)
-    away = next((c for c in competitors if c.get("homeAway") == "away"), None)
-    if home is None or away is None:
-        return None
-
-    status = competition.get("status") or {}
-    status_type = status.get("type") or {}
-    kickoff = parse_kickoff(competition.get("date") or event.get("date"))
-
-    return {
-        "id": str(event.get("id") or ""),
-        "league": league_slug,
-        "leagueName": league_name,
-        "state": status_type.get("state") or "pre",
-        "statusName": status_type.get("name") or "",
-        "statusShort": status_type.get("shortDetail") or "",
-        "statusDetail": status_type.get("detail") or "",
-        "clock": status.get("displayClock") or "",
-        "period": status.get("period") or 0,
-        "kickoff": kickoff.isoformat() if kickoff else "",
-        "kickoffEpoch": int(kickoff.timestamp()) if kickoff else 0,
-        "kickoffLocal": kickoff.astimezone().strftime("%H:%M") if kickoff else "",
-        "note": (competition.get("notes") or [{}])[0].get("headline", ""),
-        "goals": parse_goals(competition),
-        "home": parse_competitor(home),
-        "away": parse_competitor(away),
-    }
-
-
-# Only the numbers worth a line in a bar popup, in the order they are shown.
-SUMMARY_STATS = [
-    ("possessionPct", "Possession", "%"),
-    ("totalShots", "Shots", ""),
-    ("shotsOnTarget", "On target", ""),
-    ("wonCorners", "Corners", ""),
-    ("yellowCards", "Yellow cards", ""),
-    ("foulsCommitted", "Fouls", ""),
-]
-
-# The same six rows from LiveScore's counters, so a Polish match reads exactly
-# like an English one in the panel. Shots are on, off and blocked together,
-# which is what ESPN's total counts too.
-LS_STAT_KEYS = {
-    "possessionPct": ("Pss",),
-    "totalShots": ("Shon", "Shof", "Shbl"),
-    "shotsOnTarget": ("Shon",),
-    "wonCorners": ("Cos",),
-    "yellowCards": ("Ycs",),
-    "foulsCommitted": ("Fls",),
-}
-
-
-def fetch_stats(league, event_id, deadline=None):
-    """Per-team numbers for one match, from ESPN's summary endpoint.
-
-    The scoreboard carries none of this, so it costs one extra request - hence
-    only ever for the single match the panel has open.
-    """
-    if not valid_slug(league) or not valid_slug(str(event_id)):
-        return None
-    if league in LS_STAGES:
-        return fetch_livescore_stats(str(event_id)[len(LS_PREFIX):], deadline)
-    try:
-        payload = read_json_url(
-            "%s/%s/summary?event=%s" % (SITE_API, league, event_id), deadline
-        )
-    except NETWORK_ERRORS:
-        return None
-
-    teams = ((payload.get("boxscore") or {}).get("teams")) or []
-    if len(teams) < 2:
-        return None
-
-    by_id = {}
-    for team in teams:
-        team_id = str((team.get("team") or {}).get("id") or "")
-        values = {}
-        for stat in team.get("statistics") or []:
-            values[stat.get("name")] = stat.get("displayValue")
-        by_id[team_id] = values
-
-    rows = []
-    for key, label, suffix in SUMMARY_STATS:
-        present = [v.get(key) for v in by_id.values()]
-        if not any(value not in (None, "") for value in present):
-            continue
-        rows.append({"key": key, "label": label, "suffix": suffix})
-
-    return {
-        "matchId": str(event_id),
-        "at": int(time.time()),
-        "teams": by_id,
-        "rows": rows,
-    }
-
-
-def merge_stats(stored, fetched):
-    """The open cards' numbers: the fresh ones, newest first, stale ones gone."""
-    now = time.time()
-    kept = {}
-    for match_id, entry in (stored if isinstance(stored, dict) else {}).items():
-        if isinstance(entry, dict) and now - float(entry.get("at") or 0) < STATS_AGE:
-            kept[str(match_id)] = entry
-    if fetched:
-        kept[str(fetched["matchId"])] = fetched
-    if len(kept) > STATS_KEEP:
-        newest = sorted(kept.items(), key=lambda item: -float(item[1].get("at") or 0))
-        kept = dict(newest[:STATS_KEEP])
-    return kept
-
-
-def valid_slug(slug):
-    """Slugs are interpolated into a URL path; keep them to what ESPN uses."""
-    return bool(slug) and bool(SLUG_PATTERN.match(slug))
-
-
-# --------------------------------------------------------------- LiveScore
-#
-# The second source, for the competitions ESPN does not carry. Everything below
-# ends in the same match dictionary parse_event builds, so nothing downstream -
-# the sorting, the goal diff, the QML - knows there are two providers.
-
-
-def ls_events(slug, deadline=None):
-    """Every fixture of the competition's current season, one request."""
-    payload = read_json_url(
-        "%s/stage/soccer/%s/0?MD=1" % (LS_API, LS_STAGES[slug]), deadline
-    )
-    stages = payload.get("Stages") or []
-    return (stages[0].get("Events") or []) if stages else []
-
-
-# LiveScore's Eps for a match that is not simply before, during or after, in
-# the vocabulary the rest of the file speaks. The names are ESPN's, because
-# Model.js reads them to tell a goalless draw from a match never played.
-LS_SPECIAL_STATES = {
-    "HT": ("in", "STATUS_HALFTIME"),
-    "Postp.": ("post", "STATUS_POSTPONED"),
-    "Canc.": ("post", "STATUS_CANCELED"),
-    "Aband.": ("post", "STATUS_ABANDONED"),
-    "Abd": ("post", "STATUS_ABANDONED"),
-    # Stopped but not over, and the score still stands. Not ABANDONED: Model.js
-    # reads that word as a match that was never played and prints a dash where
-    # the score should be, on a row still sitting under LIVE.
-    "Susp.": ("in", "STATUS_SUSPENDED"),
-    "Int.": ("in", "STATUS_SUSPENDED"),
-}
-
-# Epr: 0 not started, 1 running, 2 over; the rest back up the labels above
-# should one of them ever be spelled differently.
-LS_PHASES = {
-    1: ("in", "STATUS_IN_PROGRESS"),
-    2: ("post", "STATUS_FULL_TIME"),
-    3: ("post", "STATUS_CANCELED"),
-    4: ("post", "STATUS_POSTPONED"),
-    6: ("in", "STATUS_SUSPENDED"),
-    8: ("post", "STATUS_ABANDONED"),
-}
-
-# Incident types that put the ball in the net: plain, penalty, own goal. A
-# shootout kick is a type of its own and stays out, as it did with ESPN.
-LS_GOAL, LS_PENALTY_GOAL, LS_OWN_GOAL = 36, 37, 39
-
-
-def ls_kickoff(event):
-    """Esd is a UTC wall clock packed into digits, because the URL asks for /0."""
-    try:
-        return datetime.strptime(str(event.get("Esd")), "%Y%m%d%H%M%S").replace(
-            tzinfo=timezone.utc
-        )
-    except (TypeError, ValueError):
-        return None
-
-
-def ls_competitor(team, score):
-    name = team.get("Nm") or "?"
-    colour = team.get("firstColor") or ""
-    return {
-        "id": LS_PREFIX + str(team.get("ID") or ""),
-        "abbr": (team.get("Abr") or name[:3]).upper(),
-        "name": name,
-        "fullName": name,
-        "logo": "%s/%s" % (LS_IMAGES, team["Img"]) if team.get("Img") else "",
-        # Only the scoreboard document carries a colour, and not for every
-        # club; Model.readableColor copes with a blank one.
-        "color": "#" + colour if colour else "",
-        "score": str(score) if score not in (None, "") else "",
-        "winner": False,
-    }
-
-
-def ls_goals(event_id, deadline=None):
-    """(goals, scoreboard) for one match, oldest goal first, or (None, None).
-
-    The scoreboard rather than the incidents document: same request, and it
-    also says what colours the two clubs play in, which the goal flash wants.
-    """
-    try:
-        board = read_json_url(
-            "%s/scoreboard/soccer/%s?locale=en" % (LS_API, event_id), deadline
-        )
-    except NETWORK_ERRORS:
-        return None, None
-    try:
-        return ls_parse_goals(board), board
-    except (AttributeError, TypeError, KeyError, IndexError, ValueError):
-        # A document in a shape this does not know costs the scorers, not the
-        # sweep: an exception here would sink every competition's results.
-        return None, None
-
-
-def ls_parse_goals(board):
-    incidents = []
-    periods = board.get("Incs-s") or {}
-    for period in sorted(periods, key=lambda key: int(key) if key.isdigit() else 99):
-        for incident in periods[period] or []:
-            # A goal and its assist arrive grouped under one entry.
-            incidents.extend(incident.get("Incs") or [incident])
-
-    goals = []
-    for incident in incidents:
-        kind = incident.get("IT")
-        if kind not in (LS_GOAL, LS_PENALTY_GOAL, LS_OWN_GOAL):
-            continue
-        minute = incident.get("Min")
-        added = incident.get("MinEx")
-        if minute is None:
-            label = ""
-        elif added:
-            label = "%d'+%d'" % (minute, added)
-        else:
-            label = "%d'" % minute
-        goals.append(
-            {
-                "minute": label,
-                # Filled in by ls_event, which is where the two club ids are.
-                "team": "",
-                "scorer": incident.get("Pn") or incident.get("Ln") or "",
-                "ownGoal": kind == LS_OWN_GOAL,
-                "penalty": kind == LS_PENALTY_GOAL,
-                # Nm is the side the goal counts for, own goals included.
-                "isHome": incident.get("Nm") == 1,
-            }
-        )
-    return goals
-
-
-def ls_event(event, slug, league_name, goals, board=None):
-    """One match; `board`, when fetched, lends the clubs their colours."""
-    home_team = (event.get("T1") or [{}])[0]
-    away_team = (event.get("T2") or [{}])[0]
-    if not home_team.get("ID") or not away_team.get("ID"):
-        return None
-    if board:
-        home_team = dict(home_team, **((board.get("T1") or [{}])[0]))
-        away_team = dict(away_team, **((board.get("T2") or [{}])[0]))
-
-    label = event.get("Eps") or ""
-    state, status_name = LS_SPECIAL_STATES.get(label) or LS_PHASES.get(
-        event.get("Epr"), ("pre", "STATUS_SCHEDULED")
-    )
-    home = ls_competitor(home_team, event.get("Tr1"))
-    away = ls_competitor(away_team, event.get("Tr2"))
-
-    # The scoreboard says which side a goal counts for, not which club id;
-    # both are known only here, where the two teams are.
-    resolved = []
-    for goal in goals or []:
-        entry = dict(goal)
-        # Read, not consumed: these goals are written to the cache and handed
-        # back in on a later sweep, and a goal that has forgotten which side it
-        # was for comes back credited to the away club - wrong colour, wrong
-        # scoreline, and a fresh goal key, so the whole match is announced again.
-        entry["team"] = home["id"] if entry.get("isHome") else away["id"]
-        resolved.append(entry)
-
-    when = ls_kickoff(event)
-    if state == "pre":
-        short = when.astimezone().strftime("%H:%M") if when else ""
-    else:
-        # Already the bar's vocabulary: "67'", "45+2'", "HT", "FT", "AET".
-        short = label
-
-    return {
-        "id": LS_PREFIX + str(event.get("Eid") or ""),
-        "league": slug,
-        "leagueName": league_name,
-        "state": state,
-        "statusName": status_name,
-        "statusShort": short,
-        "statusDetail": label,
-        "clock": short if state == "in" else "",
-        # Nothing reads it; kept so both sources build the same dictionary.
-        "period": 0,
-        "kickoff": when.isoformat() if when else "",
-        "kickoffEpoch": int(when.timestamp()) if when else 0,
-        "kickoffLocal": when.astimezone().strftime("%H:%M") if when else "",
-        "note": "",
-        "goals": resolved,
-        "home": home,
-        "away": away,
-    }
-
-
-def goal_total(match):
-    try:
-        return int(match["home"]["score"] or 0) + int(match["away"]["score"] or 0)
-    except ValueError:
-        return -1
-
-
-def fetch_livescore_league(slug, deadline=None, previous=None):
-    """Return (slug, name, matches, error), same contract as fetch_league."""
-    name = COMPETITION_LABELS.get(slug, slug)
-    try:
-        events = ls_events(slug, deadline)
-    except NETWORK_ERRORS as error:
-        return slug, name, [], str(error)
-    except Exception as error:  # noqa: BLE001 - one league must not sink the run
-        return slug, name, [], repr(error)
-
-    before = {}
-    for match in previous or []:
-        if isinstance(match, dict) and match.get("id"):
-            before[match["id"]] = match
-
-    today = datetime.now().date()
-    now = time.time()
-    matches = []
-    detailed = 0
-    for event in events:
-        try:
-            skeleton = ls_event(event, slug, name, None)
-        except (AttributeError, TypeError, KeyError, IndexError, ValueError):
-            continue
-        if skeleton is None or not is_today(skeleton, today, now):
-            continue
-
-        # The scorers are a request each, and a scoreline that has not moved
-        # cannot have grown a goal since the last sweep. Without this a Sunday
-        # afternoon of nine finished matches paid for nine requests every
-        # twenty seconds to be told the same thing.
-        prior = before.get(skeleton["id"])
-        prior_goals = prior.get("goals") if prior else None
-        # A goal is only reusable if it still says which side it was for. One
-        # written by a version that dropped that flag would come back credited
-        # to the away club, and since its score has not moved it would never be
-        # fetched again - the cache would keep the mistake indefinitely.
-        if prior_goals and not all("isHome" in goal for goal in prior_goals):
-            prior_goals = None
-        # The score can move a sweep before the scorer is written down, and a
-        # list one goal short would otherwise be reused for the rest of the
-        # match, since the scoreline it was fetched at no longer moves.
-        reused = (
-            isinstance(prior_goals, list)
-            and scoreline_of(prior) == scoreline_of(skeleton)
-            and len(prior_goals) == goal_total(skeleton)
-        )
-        # Whatever is not fetched below keeps what the last sweep had: an
-        # empty goal list written to the cache is a match whose goals are all
-        # new again the moment the next request succeeds.
-        goals = prior_goals
-        board = None
-        if not reused and skeleton["state"] != "pre" and detailed < LS_MAX_DETAIL:
-            detailed += 1
-            fetched, board = ls_goals(str(event["Eid"]), deadline)
-            if fetched is not None:
-                goals = fetched
-        if goals or board:
-            try:
-                skeleton = ls_event(event, slug, name, goals, board) or skeleton
-            except (AttributeError, TypeError, KeyError, IndexError, ValueError):
-                pass
-        if not board and prior:
-            # Only the scoreboard carries the colours; keep the last ones seen.
-            for side in ("home", "away"):
-                skeleton[side]["color"] = (prior.get(side) or {}).get("color") or ""
-        matches.append(skeleton)
-    return slug, name, matches, None
-
-
-def fetch_livescore_stats(event_id, deadline=None):
-    """Per-team numbers for one LiveScore match, in SUMMARY_STATS' vocabulary."""
-    try:
-        payload = read_json_url(
-            "%s/statistics/soccer/%s?locale=en" % (LS_API, event_id), deadline
-        )
-        board = read_json_url(
-            "%s/scoreboard/soccer/%s?locale=en" % (LS_API, event_id), deadline
-        )
-    except NETWORK_ERRORS:
-        return None
-
-    home_id = str(((board.get("T1") or [{}])[0]).get("ID") or "")
-    away_id = str(((board.get("T2") or [{}])[0]).get("ID") or "")
-    # Without both, the two sides would share one key and the panel would draw
-    # a table of labels with no numbers under them.
-    if not home_id or not away_id or home_id == away_id:
-        return None
-    sides = {1: LS_PREFIX + home_id, 2: LS_PREFIX + away_id}
-
-    by_id = {sides[1]: {}, sides[2]: {}}
-    for team in payload.get("Stat") or []:
-        side = sides.get(team.get("Tnb"))
-        if side is None:
-            continue
-        for key, source in LS_STAT_KEYS.items():
-            # Zero is a number: a missing figure is a blank, a 0 stays a 0.
-            parts = [team.get(field) for field in source]
-            try:
-                by_id[side][key] = str(sum(int(part) for part in parts))
-            except (TypeError, ValueError):
-                continue
-
-    rows = [
-        {"key": key, "label": label, "suffix": suffix}
-        for key, label, suffix in SUMMARY_STATS
-        if key in by_id[sides[1]] or key in by_id[sides[2]]
-    ]
-    if not rows:
-        return None
-    return {
-        "matchId": LS_PREFIX + str(event_id),
-        "at": int(time.time()),
-        "teams": by_id,
-        "rows": rows,
-    }
-
-
-def fetch_livescore_teams(slug):
-    """The club picker's options, read off the season's own fixture list."""
-    try:
-        events = ls_events(slug)
-    except NETWORK_ERRORS:
-        return []
-    league = COMPETITION_LABELS.get(slug, slug)
-    teams = {}
-    for event in events:
-        for team in (event.get("T1") or []) + (event.get("T2") or []):
-            if team.get("ID"):
-                teams[team["ID"]] = {
-                    "value": LS_PREFIX + str(team["ID"]),
-                    "label": team.get("Nm") or "?",
-                    "description": league,
-                }
-    return sorted(teams.values(), key=lambda team: team["label"])
-
-
-def fetch_league(slug, deadline=None, previous=None):
-    """Return (slug, name, matches, error). An error leaves matches empty."""
-    if not valid_slug(slug):
-        return slug, slug, [], "not a valid competition id"
-    if slug in LS_STAGES:
-        return fetch_livescore_league(slug, deadline, previous)
-    try:
-        payload = read_json_url("%s/%s/scoreboard" % (SITE_API, slug), deadline)
-    except NETWORK_ERRORS as error:
-        return slug, COMPETITION_LABELS.get(slug, slug), [], str(error)
-    except Exception as error:  # noqa: BLE001 - one league must not sink the run
-        return slug, COMPETITION_LABELS.get(slug, slug), [], repr(error)
-
-    leagues = payload.get("leagues") or [{}]
-    name = COMPETITION_LABELS.get(slug) or leagues[0].get("name") or slug
-
-    matches = []
-    for event in payload.get("events") or []:
-        try:
-            match = parse_event(event, slug, name)
-        except (AttributeError, TypeError, KeyError, IndexError, ValueError):
-            # A single malformed fixture is not worth losing the competition
-            # over, let alone every other one in the same run.
-            continue
-        if match is not None:
-            matches.append(match)
-    return slug, name, matches, None
-
-
-def sort_key(match, favorites):
-    involves_favorite = (
-        match["home"]["id"] in favorites or match["away"]["id"] in favorites
-    )
-    state_rank = STATE_ORDER.get(match["state"], 3)
-    # Finished matches read best newest first; everything else earliest first.
-    time_rank = -match["kickoffEpoch"] if state_rank == 2 else match["kickoffEpoch"]
-    return (state_rank, 0 if involves_favorite else 1, time_rank, match["id"])
-
-
-def is_today(match, today, now):
-    """Local calendar day, plus anything still being played and anything that
-    finished in the last few hours - a 21:00 kickoff that ends after midnight
-    belongs to the evening you watched it, not to yesterday."""
-    if match["state"] == "in":
-        return True
-    if not match["kickoffEpoch"]:
-        return False
-    # Only a match that has already kicked off can be "recent"; for a future
-    # fixture this difference is negative, which let every coming matchday
-    # through.
-    elapsed = now - match["kickoffEpoch"]
-    if 0 <= elapsed < RECENT_MATCH_AGE:
-        return True
-    return datetime.fromtimestamp(match["kickoffEpoch"]).date() == today
-
-
-def load_config(path):
-    config = dict(DEFAULT_CONFIG)
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            stored = json.load(handle)
-    except (OSError, ValueError):
-        return config
-    if isinstance(stored, dict):
-        config.update(stored)
-    return config
-
-
-def as_string_list(value):
-    if isinstance(value, str):
-        return [part for part in value.split(",") if part]
-    if isinstance(value, (list, tuple)):
-        return [str(item) for item in value if str(item)]
-    return []
-
-
-class FetchLock:
-    """Exclusive across processes. The loser gives up rather than queueing.
-
-    Queueing looked harmless until you follow it through: the second monitor's
-    process would sit blocked for as long as the first one took, and a stalled
-    endpoint froze both widgets indefinitely. Whatever the winner writes is
-    what the loser wanted anyway.
-    """
-
-    def __init__(self, path):
-        self.path = path
-        self.handle = None
-        self.acquired = False
-
-    def __enter__(self):
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        try:
-            self.handle = open(self.path, "w")
-            os.chmod(self.path, 0o600)
-            fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.acquired = True
-        except OSError as error:
-            if self.handle:
-                self.handle.close()
-                self.handle = None
-            if error.errno not in (errno.EACCES, errno.EAGAIN):
-                raise
-        return self
-
-    def __exit__(self, *_):
-        if not self.handle:
-            return
-        try:
-            if self.acquired:
-                fcntl.flock(self.handle, fcntl.LOCK_UN)
-        finally:
-            self.handle.close()
-            self.handle = None
-
-
-def load_cache(path):
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            return json.load(handle)
-    except (OSError, ValueError):
-        return {}
-
-
-def write_json_atomic(path, data):
-    directory = os.path.dirname(path) or "."
-    os.makedirs(directory, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=directory, delete=False
-    )
-    try:
-        json.dump(data, handle, ensure_ascii=False)
-        handle.flush()
-        os.fsync(handle.fileno())
-    finally:
-        handle.close()
-    os.replace(handle.name, path)
-
-
-_warned = set()
-
-
-def warn(message):
-    """Say it once per run, on stderr, where the shell log picks it up.
-
-    Quickshell keeps the helper's stderr, so this is the only channel a broken
-    desktop notification has. Once per run rather than once per goal: a missing
-    notify-send would otherwise write a line for every match in the sweep.
-    """
-    if message in _warned:
-        return
-    _warned.add(message)
-    print("elevenmates: " + message, file=sys.stderr)
-
-
-def notify(match, headline, detail="", score=None, clock=None):
-    """`score` and `clock` describe the moment being announced.
-
-    Without them the body reads off the scoreboard as it stands, which is right
-    for a final whistle and wrong for a goal being caught up on: three goals
-    found in one sweep would all have been reported at the score the third one
-    left behind.
-    """
-    body = "%s %s %s  %s" % (
-        match["home"]["name"],
-        score or scoreline_of(match),
-        match["away"]["name"],
-        clock or match["clock"] or match["statusShort"],
-    )
-    if detail:
-        body = detail + "\n" + body
-    try:
-        result = subprocess.run(
-            ["notify-send", "-a", "Elevenmates", "-u", "low", headline, body],
-            check=False,
-            timeout=5,
-            capture_output=True,
-        )
-    except FileNotFoundError:
-        warn("notify-send is not installed, so goal alerts stay on the bar only")
-        return
-    except (OSError, subprocess.SubprocessError) as error:
-        warn("notify-send could not be run: %s" % error)
-        return
-    if result.returncode != 0:
-        detail_text = (result.stderr or b"").decode("utf-8", "replace").strip()
-        warn(
-            "notify-send exited %d%s"
-            % (result.returncode, ": " + detail_text if detail_text else "")
-        )
-
-
-def safe_score(side):
-    try:
-        return int(side.get("score") or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def goals_scored(match):
-    """Total goals on the board, as a number, for comparing two snapshots."""
-    total = 0
-    for side in ("home", "away"):
-        try:
-            total += int(match[side]["score"] or 0)
-        except (TypeError, ValueError):
-            return -1
-    return total
-
-
-def goal_note(goal):
-    if goal["ownGoal"]:
-        return "o.g."
-    if goal["penalty"]:
-        return "pen."
-    return ""
-
-
-def goal_headline(goal):
-    """"Haaland 67' (pen.)" - what the bar flashes and the notification says."""
-    scorer = goal["scorer"] or "Goal"
-    if goal["ownGoal"]:
-        scorer += " (o.g.)"
-    elif goal["penalty"]:
-        scorer += " (pen.)"
-    return (scorer + " " + goal["minute"]).strip()
-
-
-def score_at(match, goals, index):
-    """The scoreline as it stood when goals[index] went in.
-
-    Counted backwards from the scoreboard rather than forwards from nothing:
-    the board is the one number that is certainly right, and ESPN sometimes
-    publishes a match's scoring plays with an early one still missing.
-    """
-    home = safe_score(match["home"])
-    away = safe_score(match["away"])
-    for later in goals[index + 1:]:
-        if later.get("team") == match["home"]["id"]:
-            home -= 1
-        else:
-            away -= 1
-    return "%d-%d" % (max(0, home), max(0, away))
-
-
-def describe_goal(match, goal, seq, score=None):
-    side = match["home"] if goal["team"] == match["home"]["id"] else match["away"]
-    return {
-        "seq": seq,
-        "at": int(time.time()),
-        "matchId": match["id"],
-        "league": match["leagueName"],
-        "team": side["abbr"],
-        "teamName": side["name"],
-        # The scoring club's own colour, for the bar to flash in.
-        "teamColor": side["color"],
-        "scorer": goal["scorer"] or "",
-        "minute": goal["minute"],
-        "note": goal_note(goal),
-        "headline": goal_headline(goal),
-        "score": score or scoreline_of(match),
-        "home": match["home"]["abbr"],
-        "away": match["away"]["abbr"],
-    }
-
-
-def scoreline_of(match):
-    return "%s-%s" % (match["home"]["score"] or "0", match["away"]["score"] or "0")
-
-
-def describe_score_move(match, old, seq):
-    """A goal ESPN has moved the score for but not yet described.
-
-    It arrives with no scorer and no minute of its own, which is exactly how it
-    should read on the bar - "GOAL (Man City) 4-2" and no name - rather than not
-    appearing at all until the detail catches up.
-    """
-    side = None
-    for key in ("home", "away"):
-        if safe_score(match[key]) > safe_score((old.get(key) or {})):
-            side = match[key]
-            break
-    if side is None:
-        return None
-    minute = match["clock"] or match["statusShort"] or ""
-    return {
-        "seq": seq,
-        "at": int(time.time()),
-        "matchId": match["id"],
-        "league": match["leagueName"],
-        "team": side["abbr"],
-        "teamName": side["name"],
-        "teamColor": side["color"],
-        "scorer": "",
-        "minute": minute,
-        "note": "",
-        "headline": minute or "Goal",
-        "score": scoreline_of(match),
-        "home": match["home"]["abbr"],
-        "away": match["away"]["abbr"],
-        # Flagged so the scoring play, when it turns up a sweep or two later,
-        # can take this entry's place instead of being a second celebration of
-        # the same goal.
-        "placeholder": True,
-    }
-
-
-def take_placeholder(feed, match_id):
-    """Pull this match's oldest unnamed goal off the feed, if it has one."""
-    for index, entry in enumerate(feed):
-        if entry.get("placeholder") and entry.get("matchId") == match_id:
-            return index, entry
-    return None, None
-
-
-def announce_changes(
-    previous, matches, favorites, alerts, watched_ids, notify_all, notify_enabled,
-    feed
-):
-    """Find what happened since the last run: goals, and any final whistle.
-
-    Every goal found is appended to the feed so the bar can celebrate each one
-    in turn, whether or not desktop notifications are on - but only for a match
-    the user actually follows. A goal in some competition they merely subscribed
-    to is not their business.
-    """
-    previous_matches = previous.get("matches") or []
-    before = {m["id"]: m for m in previous_matches}
-    seq = int((previous.get("lastGoal") or {}).get("seq") or 0)
-    feed = list(feed)
-
-    for match in matches:
-        old = before.get(match["id"])
-        if not isinstance(old, dict) or "state" not in old:
-            # A cache written by an older version, or edited by hand. Skip the
-            # comparison rather than raising and leaving the file unwritable.
-            continue
-        # The bell, a club you follow, or the match the bar is holding. Anything
-        # else is a fixture that merely came along with its competition.
-        watched = (
-            notify_all
-            or match["id"] in alerts
-            or match["id"] in watched_ids
-            or match["home"]["id"] in favorites
-            or match["away"]["id"] in favorites
-        )
-
-        if not watched:
-            continue
-
-        seen = set(goal_keys(match["id"], old.get("goals") or []))
-        current = match.get("goals") or []
-        fresh = [
-            (index, goal)
-            for index, (goal, key) in enumerate(
-                zip(current, goal_keys(match["id"], current))
-            )
-            if key not in seen
-        ]
-        if fresh and match["state"] != "pre":
-            # Two goals can land inside one refresh interval, and both deserve
-            # their own celebration rather than only the later one - each at the
-            # score it was actually scored at.
-            for index, goal in fresh:
-                score = score_at(match, current, index)
-                # This may be the goal an unnamed one already stood for. If so
-                # it takes that entry's place, keeping its number and its time
-                # so the bar does not celebrate the same goal twice, and no
-                # second notification goes out for it either.
-                slot, placeholder = take_placeholder(feed, match["id"])
-                if placeholder is not None:
-                    named = describe_goal(match, goal, placeholder["seq"], score)
-                    named["at"] = placeholder["at"]
-                    feed[slot] = named
-                    continue
-
-                seq += 1
-                entry = describe_goal(match, goal, seq, score)
-                feed.append(entry)
-                if notify_enabled:
-                    notify(
-                        match,
-                        "Goal - " + match["leagueName"],
-                        entry["teamName"] + ": " + entry["headline"],
-                        entry["score"],
-                        goal.get("minute") or None,
-                    )
-        elif match["state"] == "in" and goals_scored(match) > goals_scored(old):
-            # A score that moved without a scoring play behind it, which happens
-            # while ESPN is still filling in the detail. Only upwards: VAR and
-            # score corrections move it back down, and that is not a goal.
-            #
-            # This goes on the feed like any other. It used to raise a desktop
-            # notification and nothing else, so with alerts switched off the one
-            # case the bar flash exists to cover was the one case it missed.
-            seq += 1
-            entry = describe_score_move(match, old, seq)
-            if entry is not None:
-                feed.append(entry)
-            if notify_enabled:
-                notify(match, "Goal - " + match["leagueName"])
-
-        if notify_enabled and match["state"] == "post" and old["state"] == "in":
-            notify(match, "Full time - " + match["leagueName"])
-
-    return feed[-GOAL_FEED_KEEP:]
 
 
 def prune_follows(config_path, config, matches, errors, leagues):
-    """Forget bells and a pin whose match has left today's card.
-
-    Only after a clean sweep: a competition that failed to answer keeps its
-    previous matches, but one that failed before it was ever read would look
-    like every match in it had simply ended, and would quietly clear the very
-    row the bar is sitting on.
-    """
+    """Forget bells and a pin whose match has left today's card."""
     if not leagues or errors:
         return
     current = {match["id"] for match in matches}
-
-    # Read the file again and decide from that, not from the copy this run
-    # started with: a sweep can take most of a minute, and a pin set while it
-    # was in flight would otherwise be cleared for not being on a card that was
-    # fetched before it existed.
     stored = load_config(config_path)
     alerts = as_string_list(stored.get("alertMatches"))
     kept = [match_id for match_id in alerts if match_id in current]
@@ -1362,20 +73,52 @@ def prune_follows(config_path, config, matches, errors, leagues):
         pass
 
 
-def command_fetch(args):
-    lock_path = os.path.join(os.path.dirname(args.out) or ".", LOCK_NAME)
-    with FetchLock(lock_path) as lock:
-        if not lock.acquired:
-            # Another monitor's widget is already doing exactly this.
-            return 0
-        return fetch_once(args)
+def select_fetch_targets(leagues, previous, force, now=None):
+    """During live play, poll only active leagues; full-scan every 15 min."""
+    now = time.time() if now is None else now
+    previous_matches = previous.get("matches") or []
+    previous_by_league = {}
+    for match in previous_matches:
+        if isinstance(match, dict) and match.get("league"):
+            previous_by_league.setdefault(match["league"], []).append(match)
+
+    prev_leagues_map = previous.get("leagues") if isinstance(previous.get("leagues"), dict) else {}
+    full_sweep_at = float(previous.get("fullSweepAt") or 0)
+    has_live = any(isinstance(m, dict) and m.get("state") == "in" for m in previous_matches)
+    active_leagues = [s for s in leagues if previous_by_league.get(s)]
+    partial = (
+        has_live
+        and bool(active_leagues)
+        and not force
+        and set(leagues) == set(prev_leagues_map.keys())
+        and (now - full_sweep_at) < FULL_SWEEP_INTERVAL
+    )
+    return (active_leagues if partial else leagues), partial, previous_by_league
+
+
+def refresh_stats_only(args, previous, deadline=None):
+    """The scoreboards are fresh enough; only the open match may need numbers."""
+    if not args.stats or ":" not in args.stats:
+        return 0
+    league, _, event_id = args.stats.partition(":")
+    stored = previous.get("statsByMatch")
+    stored = stored if isinstance(stored, dict) else {}
+    current = stored.get(str(event_id))
+    if (
+        isinstance(current, dict)
+        and current.get("events") is not None
+        and time.time() - float(current.get("at") or 0) < MIN_REFRESH_AGE
+    ):
+        return 0
+    fetched = fetch_stats(league, event_id, deadline)
+    if fetched is None:
+        return 0
+    previous["statsByMatch"] = merge_stats(stored, fetched)
+    write_json_atomic(args.out, previous)
+    return 0
 
 
 def fetch_once(args):
-    # On a machine that has never run this, write the defaults out before doing
-    # anything else. The widget reads the file, not the helper's idea of the
-    # defaults, and without this a fresh install fetched ten competitions while
-    # the bar insisted none were picked.
     if not os.path.exists(args.config):
         write_json_atomic(args.config, dict(DEFAULT_CONFIG))
 
@@ -1385,54 +128,42 @@ def fetch_once(args):
     notify_enabled = bool(config.get("goalNotifications", True))
     notify_all = bool(config.get("notifyAll", False))
     alerts = set(as_string_list(config.get("alertMatches")))
-    # The guard exists to stop a post-suspend cache being diffed as fresh news.
-    # A fixed twenty minutes silently disabled goal alerts for anyone who set a
-    # longer idle interval, so it has to clear that interval by a margin.
+
     try:
-        idle_minutes = float(config.get("idleRefreshMin") or 20)
+        idle_minutes = float(config.get("idleRefreshMin") or 12)
     except (TypeError, ValueError):
-        idle_minutes = 20
-    # It has to clear the longest gap the widget will actually leave, which is
-    # the stretched idle interval, not the plain one.
+        idle_minutes = 12
     stale_age = max(
         STALE_CACHE_AGE, idle_minutes * 60 * 2.5, IDLE_STRETCH_CAP + 5 * 60
     )
     pinned = str(config.get("pinnedMatch") or "")
-    # Whatever the bar is actually carrying counts too, otherwise a default
-    # install - no favourites, no bells, nothing pinned - would watch the bar
-    # change from 0-0 to 1-0 with no alert at all.
     watched_ids = {pinned, str(args.headline or "")} - {""}
     previous = load_cache(args.out)
-    # Clamped at zero: a cache stamped in the future - a clock step, a restore
-    # from a machine that was ahead - would otherwise read as forever fresh and
-    # every fetch would degrade to a no-op until wall-clock time caught up.
     age = max(0.0, time.time() - float(previous.get("updatedAt") or 0))
     deadline = time.time() + FETCH_BUDGET
 
-    # Another monitor's widget just did this. Fetch the statistics if they are
-    # what is actually missing, and otherwise leave the file alone. A refresh
-    # the user asked for by hand is never skipped.
     if previous.get("matches") and age < MIN_REFRESH_AGE and not args.force:
         return refresh_stats_only(args, previous, deadline)
 
     previous_matches = previous.get("matches") or []
-    previous_by_league = {}
-    for match in previous_matches:
-        if isinstance(match, dict) and match.get("league"):
-            previous_by_league.setdefault(match["league"], []).append(match)
+    prev_leagues_map = previous.get("leagues") if isinstance(previous.get("leagues"), dict) else {}
+    full_sweep_at = float(previous.get("fullSweepAt") or 0)
+    fetch_targets, partial_live_sweep, previous_by_league = select_fetch_targets(
+        leagues, previous, args.force
+    )
 
     matches = []
     errors = []
-    league_names = {}
-    if leagues:
-        workers = min(MAX_PARALLEL_REQUESTS, len(leagues))
+    league_names = dict(prev_leagues_map) if partial_live_sweep else {}
+    if fetch_targets:
+        workers = min(MAX_PARALLEL_REQUESTS, len(fetch_targets))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             results = list(
                 pool.map(
                     lambda slug: fetch_league(
                         slug, deadline, previous_by_league.get(slug)
                     ),
-                    leagues,
+                    fetch_targets,
                 )
             )
         for slug, name, league_matches, error in results:
@@ -1440,7 +171,6 @@ def fetch_once(args):
             if error is None:
                 matches.extend(league_matches)
             else:
-                # Keep yesterday's answer rather than emptying the bar.
                 matches.extend(previous_by_league.get(slug, []))
                 errors.append("%s: %s" % (name, error))
 
@@ -1457,22 +187,16 @@ def fetch_once(args):
     last_goal = previous.get("lastGoal")
     stored_feed = previous.get("goalFeed")
     feed = list(stored_feed) if isinstance(stored_feed, list) else []
-    # After a suspend the cache describes a different afternoon; diffing it
-    # would fire a burst of notifications for matches that ended hours ago.
     if previous_matches and age < stale_age:
         feed = announce_changes(
             previous, matches, favorites, alerts, watched_ids,
-            notify_all, notify_enabled, feed
+            notify_all, notify_enabled, feed,
         )
         if feed:
             last_goal = feed[-1]
 
-    # Bells and the pin name a match, and a match id is good for one day. Left
-    # alone they pile up in the config file for every Saturday ever watched.
     prune_follows(args.config, config, matches, errors, leagues)
 
-    # A run without --stats must not wipe the numbers another monitor's open
-    # panel is reading, and a run with one must not evict them either.
     stats = merge_stats(previous.get("statsByMatch"), None)
     if args.stats and ":" in args.stats:
         league, _, event_id = args.stats.partition(":")
@@ -1482,6 +206,7 @@ def fetch_once(args):
 
     state = {
         "updatedAt": int(time.time()),
+        "fullSweepAt": int(full_sweep_at) if partial_live_sweep else int(time.time()),
         "statsByMatch": stats,
         "leagues": league_names,
         "error": "; ".join(errors) if errors else "",
@@ -1492,6 +217,14 @@ def fetch_once(args):
     }
     write_json_atomic(args.out, state)
     return 1 if errors and not matches else 0
+
+
+def command_fetch(args):
+    lock_path = os.path.join(os.path.dirname(args.out) or ".", LOCK_NAME)
+    with FetchLock(lock_path) as lock:
+        if not lock.acquired:
+            return 0
+        return fetch_once(args)
 
 
 def command_config(args):
@@ -1518,14 +251,6 @@ def command_config(args):
 
 
 def command_demo(args):
-    """Fire the goal alert once, off a fixture invented for the purpose.
-
-    There is no other way to see what a goal looks like without waiting for
-    one, and waiting is a poor way to check a colour. It used to be announced
-    off a match in the cache and did nothing whatsoever without one - which is
-    every install before the first fetch, and every day the followed
-    competitions have nothing on.
-    """
     state = load_cache(args.out)
     goal = dict(
         DEMO_GOAL,
@@ -1545,24 +270,6 @@ def command_demo(args):
     return 0
 
 
-def refresh_stats_only(args, previous, deadline=None):
-    """The scoreboards are fresh enough; only the open match may need numbers."""
-    if not args.stats or ":" not in args.stats:
-        return 0
-    league, _, event_id = args.stats.partition(":")
-    stored = previous.get("statsByMatch")
-    stored = stored if isinstance(stored, dict) else {}
-    current = stored.get(str(event_id))
-    if isinstance(current, dict) and time.time() - float(current.get("at") or 0) < MIN_REFRESH_AGE:
-        return 0
-    fetched = fetch_stats(league, event_id, deadline)
-    if fetched is None:
-        return 0
-    previous["statsByMatch"] = merge_stats(stored, fetched)
-    write_json_atomic(args.out, previous)
-    return 0
-
-
 def command_leagues(_args):
     json.dump(
         [
@@ -1573,33 +280,6 @@ def command_leagues(_args):
         ensure_ascii=False,
     )
     return 0
-
-
-def fetch_teams(slug):
-    if slug in LS_STAGES:
-        return fetch_livescore_teams(slug)
-    try:
-        payload = read_json_url("%s/%s/teams" % (SITE_API, slug))
-    except NETWORK_ERRORS:
-        return []
-    try:
-        entries = payload["sports"][0]["leagues"][0]["teams"]
-    except (KeyError, IndexError, TypeError):
-        return []
-    league = COMPETITION_LABELS.get(slug, slug)
-    teams = []
-    for entry in entries:
-        team = entry.get("team") or {}
-        if not team.get("id"):
-            continue
-        teams.append(
-            {
-                "value": str(team["id"]),
-                "label": team.get("displayName") or team.get("shortDisplayName") or "?",
-                "description": league,
-            }
-        )
-    return teams
 
 
 def command_teams(args):
@@ -1620,7 +300,6 @@ def command_teams(args):
         with ThreadPoolExecutor(max_workers=workers) as pool:
             for teams in pool.map(fetch_teams, leagues):
                 for team in teams:
-                    # A club in two competitions is listed once, under the first.
                     by_id.setdefault(team["value"], team)
     options = sorted(by_id.values(), key=lambda team: team["label"].lower())
     if options:
@@ -1635,11 +314,6 @@ def command_teams(args):
 def main(argv):
     parser = argparse.ArgumentParser(prog="elevenmates", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-
-    # Accepted on either side of the subcommand. They cannot share a dest: the
-    # subparser writes its own default over whatever the top-level one parsed,
-    # so `elevenmates --config mine.json config set ...` used to read and then
-    # rewrite the real config file instead of the one asked for.
     parser.add_argument(
         "--config", default=CONFIG_PATH, dest="global_config", metavar="PATH"
     )
@@ -1648,24 +322,11 @@ def main(argv):
         sub.add_argument("--config", default=None, metavar="PATH")
         return sub
 
-
     fetch = with_config(commands.add_parser("fetch", help="refresh the score cache"))
     fetch.add_argument("--out", default=STATE_PATH)
-    fetch.add_argument(
-        "--force",
-        action="store_true",
-        help="refresh even if another widget just did; for a manual refresh",
-    )
-    fetch.add_argument(
-        "--headline",
-        default="",
-        help="the match the bar is currently showing, so its goals count as watched",
-    )
-    fetch.add_argument(
-        "--stats",
-        default="",
-        help="<league>:<event> - also fetch that one match's team statistics",
-    )
+    fetch.add_argument("--force", action="store_true")
+    fetch.add_argument("--headline", default="")
+    fetch.add_argument("--stats", default="")
     fetch.set_defaults(handler=command_fetch)
 
     config = with_config(commands.add_parser("config", help="read or change a setting"))

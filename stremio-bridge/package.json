@@ -1,0 +1,10 @@
+{
+  "name": "stremio-football-board",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local Stremio addon surfacing football matches from Sports Streams on the Home screen (Board).",
+  "scripts": {
+    "start": "node server.mjs"
+  }
+}

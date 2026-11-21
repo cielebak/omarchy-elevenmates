@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.1.0 - 2026-11-21
+
+- Match timeline in expanded cards: goals with assists, yellow and red cards,
+  missed penalties, and a FotMob-style `Key | All` toggle to reveal
+  substitutions (`↑ in / ↓ out`). Both timeline and stat meters align directly
+  under the match score without clipping names.
+- Goal attribution and alert fixes: missing `team.id` (ESPN) or nested `Nm`
+  (LiveScore) no longer defaults to the away side, and a lagging scoreboard no
+  longer announces `0-0` or fires a duplicate placeholder alert.
+- Faster live refresh: during live play only competitions with matches today
+  are polled (with a full sweep every 15 minutes), lowering the live refresh
+  floor (defaults now `25 s` live / `12 min` idle).
+- Optional Stremio / MPV integration (off by default in **SETTINGS**): adds a
+  **STREMIO** tab, live bridge status/expiry notices, and one-click `▶` stream
+  playback in MPV or Stremio via the bundled zero-dependency `stremio-bridge/`.
+- Modularized Python backend (`bin/elevenmates_lib/`), split QML tabs
+  (`SettingsTab.qml`, `StremioTab.qml`), and added `tests/test_elevenmates.py`.
+
 ## 1.0.1 - 2026-10-16
 
 - Ekstraklasa works again. Sofascore started refusing every request that does

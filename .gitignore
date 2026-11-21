@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 *.qml.orig
+.serena/
+stremio-bridge/.env

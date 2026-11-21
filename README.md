@@ -66,10 +66,11 @@ nothing left to follow and no goal left to announce. One that was already on
 stays until you turn it off, so a row never carries a setting you cannot
 clear.
 
-Clicking the rest of the row opens the match: who scored and when, then
+Clicking the rest of the row opens the match: timeline with goals (and assists),
+yellow/red cards and a `Key | All` toggle for substitutions, followed by
 possession, shots, shots on target, corners, cards and fouls, each with a meter
-so the shape of the match reads without reading a number. Those numbers cost
-their own request, so they are only fetched for the match you have open.
+aligned under the score. Those numbers and events cost their own request, so
+they are only fetched for the match you have open.
 
 ## Settings
 
@@ -77,12 +78,43 @@ In the panel, under **SETTINGS**:
 
 | Setting | What it does |
 | --- | --- |
-| Competitions | Which ones are fetched. One request each, so a shorter list refreshes faster and a longer one raises the floor under the live refresh interval. Pick none and the widget shows nothing at all. |
+| Competitions | Which ones are fetched. While matches are live, only competitions with games today are polled (with a full sweep every 15 minutes), keeping traffic low even with a long list. |
 | Your clubs | Their matches sort first, the bar prefers them, and they get goal alerts without touching the bell. |
 | What the bar shows | `Auto` falls back to any live match when none of your clubs are playing. `Favorites only` and `Any live match` are the strict readings. `Picked match only` does not fall back at all: with no eye on a row the bar carries nothing and shrinks to the ball. |
 | Notify on goals | And whether that covers every match or only the ones you marked. |
-| Refresh intervals | One for while a match is live, one for the rest of the day. The live one will not go below two seconds per competition followed. With nothing at all on today's card the idle one stretches itself, and stretches further between 01:00 and 07:00. |
-| Test the goal alert | Fires the alert once off a real match, so the colours can be checked without waiting for someone to score. |
+| Stremio / MPV integration | Optional (off by default). Shows the **STREMIO** tab and `▶` buttons on live matches matched to a local stream bridge. |
+| Refresh intervals | One for while a match is live, one for the rest of the day. The live floor scales with competitions active today rather than the entire picker. With nothing on today's card the idle one stretches itself, and stretches further between 01:00 and 07:00. |
+| Test the goal alert | Fires the alert once off a demo fixture, so the colours can be checked without waiting for someone to score. |
+
+## Stremio / MPV integration (optional)
+
+Off by default — when disabled, Elevenmates makes no local requests and hides
+every Stremio control.
+
+Turn on **Stremio / MPV integration** in **SETTINGS** to enable:
+
+- A **`▶` play button** on live rows that match an active stream, plus per-channel
+  stream pills at the bottom of an expanded match card.
+- A **`STREMIO` tab** showing bridge status (including upstream notices such as
+  an expired subscription) and a player picker (**MPV** or **Stremio**).
+
+The integration talks to the bundled zero-dependency Node.js bridge in
+[`stremio-bridge/`](stremio-bridge/) on `http://127.0.0.1:7040` (configurable
+via `stremioUrl` in `~/.config/omarchy/elevenmates.json`). The bridge wraps the
+**Sports Streams (Highfly)** Stremio addon, exposes football matches on
+Stremio's Home screen (`http://127.0.0.1:7040/manifest.json`), and resolves live
+fixtures for Elevenmates:
+
+```bash
+cd stremio-bridge
+cp .env.example .env          # set UPSTREAM_MANIFEST_URL to your Sports Streams manifest.json
+node server.mjs               # listens on http://127.0.0.1:7040
+```
+
+In **MPV** mode clicking `▶` launches the highest-ranked stream directly with
+backup streams queued in the playlist (press `>` in MPV to switch); in
+**Stremio** mode it opens the match detail via `stremio://`. Elevenmates itself
+requires neither Stremio, MPV, nor the bridge to work.
 
 Settings live in `~/.config/omarchy/elevenmates.json`, not in the widget's
 `shell.json` entry. `omarchy bar set` hands its value to the shell over an IPC

@@ -65,15 +65,31 @@ BarWidget {
   readonly property string barMode: String(conf("barMode", "Auto"))
   readonly property bool goalNotifications: conf("goalNotifications", true) !== false
   readonly property bool notifyAll: conf("notifyAll", false) === true
-  // Every competition is its own request, so the shortest sensible interval is
-  // not a constant: twenty seconds is polite for a couple of leagues and forty
-  // requests a minute to ESPN for the whole picker list. Two seconds apiece
-  // keeps the sweep near one request every two seconds whatever is followed.
+  readonly property bool stremioEnabled: conf("stremioEnabled", false) === true
+  readonly property string stremioUrl: String(conf("stremioUrl", "http://127.0.0.1:7040"))
+  readonly property string stremioPlayer: String(conf("stremioPlayer", "mpv"))
+  // During live sweeps the helper polls only leagues that actually have games
+  // today, so the floor follows active leagues rather than every tournament in
+  // the picker.
+  readonly property int activeLeagueCount: {
+    var list = root.matches || []
+    if (list.length === 0) return root.leagues.length
+    var seen = {}
+    var count = 0
+    for (var i = 0; i < list.length; i++) {
+      var slug = list[i] && list[i].league
+      if (slug && !seen[slug]) {
+        seen[slug] = true
+        count++
+      }
+    }
+    return count > 0 ? count : root.leagues.length
+  }
   readonly property int minLiveRefreshSec:
-    Math.max(20, Math.min(120, root.leagues.length * 2))
+    Math.max(15, Math.min(60, Math.max(1, root.activeLeagueCount) * 2))
   readonly property int liveRefreshSec:
-    Math.max(root.minLiveRefreshSec, Number(conf("liveRefreshSec", 60)) || 60)
-  readonly property int idleRefreshMin: Math.max(1, Number(conf("idleRefreshMin", 20)) || 20)
+    Math.max(root.minLiveRefreshSec, Number(conf("liveRefreshSec", 25)) || 25)
+  readonly property int idleRefreshMin: Math.max(1, Number(conf("idleRefreshMin", 12)) || 12)
 
   // Only a change to what is fetched is worth a round trip; pinning and the
   // display options are read straight off the cache already in hand.
@@ -170,9 +186,10 @@ BarWidget {
     root.expandedLeague = id === "" ? "" : league
     root.expandedMatch = id
     // Collapsing needs no data, and neither does reopening a card whose
-    // numbers are already in the cache.
+    // numbers and timeline are already fresh in the cache.
     if (id === "") return
-    if (root.scores.statsByMatch && root.scores.statsByMatch[id]) return
+    var cached = root.scores.statsByMatch ? root.scores.statsByMatch[id] : null
+    if (cached && cached.events !== undefined && (Date.now() / 1000 - Number(cached.at || 0)) < 45) return
     root.refresh()
   }
 
